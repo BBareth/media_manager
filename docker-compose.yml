@@ -1,0 +1,33 @@
+services:
+  media_manager:
+    image: bareth31/epsilon:media_manager
+    container_name: media_manager
+    ports:
+      - "8080:8080"
+    environment:
+      # How long (seconds) downloaded/converted files live before auto-deletion.
+      # Default is one day. Lower it to keep less on disk.
+      MEDIA_RETENTION_SECS: "86400"
+      PORT: "8080"
+    volumes:
+      # Transient working storage. Files here are auto-deleted after the
+      # retention window, so it does not need backups.
+      #
+      # Option A (default): a Docker named volume. Lives under
+      # /var/lib/docker/volumes on the host — make sure THAT disk has space.
+      - media_data:/data
+      #
+      # Option B (recommended on Proxmox if the Docker root disk is small):
+      # bind-mount a folder on a disk with plenty of free space. Comment out
+      # the line above and uncomment the one below (create the folder first):
+      # - /mnt/media_manager_data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/api/health').read()==b'ok' else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  media_data:
