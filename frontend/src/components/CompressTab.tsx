@@ -1,6 +1,7 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { Job, startCompress } from "../api";
 import { formatBytes } from "../format";
+import FilePicker from "./FilePicker";
 import JobList from "./JobList";
 
 interface Props {
@@ -11,13 +12,13 @@ interface Props {
 export default function CompressTab({ jobs, onChanged }: Props) {
   const [files, setFiles] = useState<File[]>([]);
   const [targetMb, setTargetMb] = useState("50");
+  const [combineAudio, setCombineAudio] = useState(false);
   const [busy, setBusy] = useState(false);
   const [uploadIndex, setUploadIndex] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
 
-  function onPick(list: FileList | null) {
-    setFiles(list ? Array.from(list) : []);
+  function onPick(picked: File[]) {
+    setFiles(picked);
     setError(null);
   }
 
@@ -46,7 +47,7 @@ export default function CompressTab({ jobs, onChanged }: Props) {
     for (let i = 0; i < files.length; i++) {
       setUploadIndex(i + 1);
       try {
-        await startCompress(files[i], target);
+        await startCompress(files[i], target, combineAudio);
         onChanged();
       } catch (err) {
         failures.push(`${files[i].name}: ${err instanceof Error ? err.message : String(err)}`);
@@ -55,23 +56,21 @@ export default function CompressTab({ jobs, onChanged }: Props) {
     setBusy(false);
     setUploadIndex(0);
     setFiles([]);
-    if (inputRef.current) inputRef.current.value = "";
     if (failures.length > 0) setError(failures.join("\n"));
   }
 
   return (
     <div className="tab-panel">
       <form className="card form" onSubmit={submit}>
-        <label className="field">
+        <div className="field">
           <span>Videos or images (select multiple to queue them)</span>
-          <input
-            ref={inputRef}
-            type="file"
+          <FilePicker
             multiple
             accept="audio/*,video/*,image/*,.avi,.mkv,.mov,.flv,.wmv,.m4v"
-            onChange={(e) => onPick(e.target.files)}
+            fileNames={files.map((f) => f.name)}
+            onPick={onPick}
           />
-        </label>
+        </div>
 
         <div className="field-row">
           <label className="field">
@@ -93,6 +92,18 @@ export default function CompressTab({ jobs, onChanged }: Props) {
                 : "Compress"}
           </button>
         </div>
+
+        <label className="checkbox-field">
+          <input
+            type="checkbox"
+            checked={combineAudio}
+            onChange={(e) => setCombineAudio(e.target.checked)}
+          />
+          <span>
+            Combine all audio tracks into one
+            <span className="muted"> — merges separate game/mic tracks (e.g. ShadowPlay) into a single track</span>
+          </span>
+        </label>
 
         {files.length > 0 && (
           <ul className="file-queue">

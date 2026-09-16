@@ -41,7 +41,9 @@ fn sweep(state: &AppState) {
     // 2. Remove orphaned directories on disk (e.g. left by a crash) whose
     //    modification time is older than the retention window.
     let cutoff_system = UNIX_EPOCH + Duration::from_secs(cutoff.max(0) as u64);
-    let Ok(entries) = fs::read_dir(&state.data_dir) else { return };
+    let Ok(entries) = fs::read_dir(&state.data_dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {

@@ -1,6 +1,7 @@
 mod cleanup;
 mod compress;
 mod download;
+mod encode_plan;
 mod jobs;
 mod proc;
 mod state;
@@ -86,9 +87,7 @@ async fn main() {
     tracing::info!("data dir: {}", data_dir.display());
     tracing::info!("retention: {retention_secs}s");
 
-    axum::serve(listener, app)
-        .await
-        .expect("server error");
+    axum::serve(listener, app).await.expect("server error");
 }
 
 fn env_or(key: &str, default: &str) -> String {

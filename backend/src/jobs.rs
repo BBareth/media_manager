@@ -25,10 +25,7 @@ pub async fn get_job(
 }
 
 /// DELETE /api/jobs/{id} — remove the job and delete all of its files.
-pub async fn delete_job(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> StatusCode {
+pub async fn delete_job(State(state): State<AppState>, Path(id): Path<String>) -> StatusCode {
     match state.remove_job(&id) {
         Some(job) => {
             let _ = fs::remove_dir_all(&job.dir);
@@ -39,10 +36,7 @@ pub async fn delete_job(
 }
 
 /// GET /api/jobs/{id}/file — stream the finished output as an attachment.
-pub async fn download_output(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn download_output(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let Some(job) = state.get_job(&id) else {
         return (StatusCode::NOT_FOUND, "job not found").into_response();
     };
@@ -58,7 +52,10 @@ pub async fn download_output(
         Err(_) => return (StatusCode::NOT_FOUND, "output file missing").into_response(),
     };
 
-    let name = job.output_name.clone().unwrap_or_else(|| "download".to_string());
+    let name = job
+        .output_name
+        .clone()
+        .unwrap_or_else(|| "download".to_string());
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
@@ -84,7 +81,13 @@ pub async fn download_output(
 fn content_disposition(name: &str) -> String {
     let ascii: String = name
         .chars()
-        .map(|c| if c.is_ascii() && c != '"' && c != '\\' && !c.is_control() { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii() && c != '"' && c != '\\' && !c.is_control() {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!(
         "attachment; filename=\"{}\"; filename*=UTF-8''{}",
@@ -97,8 +100,7 @@ fn content_disposition(name: &str) -> String {
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
-        let unreserved = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
         if unreserved {
             out.push(byte as char);
         } else {

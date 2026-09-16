@@ -43,18 +43,28 @@ export async function startDownload(params: DownloadParams): Promise<Job> {
   return res.json();
 }
 
-export async function startTranscode(file: File, format: string): Promise<Job> {
+export async function startTranscode(
+  file: File,
+  format: string,
+  combineAudio: boolean
+): Promise<Job> {
   const form = new FormData();
   form.append("format", format);
+  form.append("combine_audio", combineAudio ? "true" : "false");
   form.append("file", file);
   const res = await fetch(`${API}/transcode`, { method: "POST", body: form });
   if (!res.ok) return asError(res);
   return res.json();
 }
 
-export async function startCompress(file: File, targetMb: number): Promise<Job> {
+export async function startCompress(
+  file: File,
+  targetMb: number,
+  combineAudio: boolean
+): Promise<Job> {
   const form = new FormData();
   form.append("target_mb", String(targetMb));
+  form.append("combine_audio", combineAudio ? "true" : "false");
   form.append("file", file);
   const res = await fetch(`${API}/compress`, { method: "POST", body: form });
   if (!res.ok) return asError(res);

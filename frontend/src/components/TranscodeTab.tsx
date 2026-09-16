@@ -1,5 +1,6 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { Job, startTranscode } from "../api";
+import FilePicker from "./FilePicker";
 import JobList from "./JobList";
 
 interface Props {
@@ -13,9 +14,9 @@ const AUDIO_FORMATS = ["mp3", "m4a", "ogg", "opus", "wav", "flac"];
 export default function TranscodeTab({ jobs, onChanged }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [format, setFormat] = useState("mp4");
+  const [combineAudio, setCombineAudio] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -26,9 +27,8 @@ export default function TranscodeTab({ jobs, onChanged }: Props) {
     }
     setBusy(true);
     try {
-      await startTranscode(file, format);
+      await startTranscode(file, format, combineAudio);
       setFile(null);
-      if (inputRef.current) inputRef.current.value = "";
       onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -40,15 +40,14 @@ export default function TranscodeTab({ jobs, onChanged }: Props) {
   return (
     <div className="tab-panel">
       <form className="card form" onSubmit={submit}>
-        <label className="field">
+        <div className="field">
           <span>Source file</span>
-          <input
-            ref={inputRef}
-            type="file"
+          <FilePicker
             accept="audio/*,video/*,.avi,.mkv,.mov,.flv,.wmv,.m4v"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            fileNames={file ? [file.name] : []}
+            onPick={(files) => setFile(files[0] ?? null)}
           />
-        </label>
+        </div>
 
         <div className="field-row">
           <label className="field">
@@ -71,14 +70,27 @@ export default function TranscodeTab({ jobs, onChanged }: Props) {
             </select>
           </label>
 
+          <label className="field">
+            <span>Audio tracks</span>
+            <select
+              value={combineAudio ? "combine" : "keep"}
+              onChange={(e) => setCombineAudio(e.target.value === "combine")}
+            >
+              <option value="keep">Keep tracks separate</option>
+              <option value="combine">Combine into one track</option>
+            </select>
+          </label>
+
           <button className="btn btn-primary submit" type="submit" disabled={busy}>
             {busy ? "Uploading…" : "Convert"}
           </button>
         </div>
 
-        {file && (
+        {!combineAudio && ["mp3", "opus", "wav", "flac"].includes(format) && (
           <p className="hint">
-            Selected: <strong>{file.name}</strong>
+            {format.toUpperCase()} files hold a single audio track. If the source has several,
+            choose "Combine into one track" — or convert to MKV, MP4, M4A or OGG to keep them
+            separate.
           </p>
         )}
         {error && <p className="form-error">{error}</p>}
