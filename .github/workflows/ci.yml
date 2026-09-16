@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  backend:
+    name: Backend (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Check formatting
+        working-directory: backend
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        working-directory: backend
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        working-directory: backend
+        run: cargo test --all-features
+
+  frontend:
+    name: Frontend (typecheck, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  docker:
+    name: Docker image (build + smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: media_manager:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+
+          # The tools the app shells out to must actually be in the image.
+          docker run --rm media_manager:ci yt-dlp --version
+          docker run --rm media_manager:ci ffmpeg -version | head -n 1
+          docker run --rm media_manager:ci ffprobe -version | head -n 1
+
+          docker run -d --name mm-ci -p 8080:8080 media_manager:ci
+
+          # Poll rather than sleep a fixed amount: fast when it is fast,
+          # and it prints the container log if it never comes up.
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/api/health | grep -qx ok; then
+              echo "health ok after ${i}s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::container did not become healthy in 30s"
+              docker logs mm-ci
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # The SPA itself must be served, not just the API.
+          curl -fsS http://localhost:8080/ | grep -qi '<div id="root">'
+
+          # A rejected scheme should not start a job (see SECURITY.md).
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST http://localhost:8080/api/downloads \
+            -H 'content-type: application/json' \
+            -d '{"url":"file:///etc/passwd","format":"mp4","quality":"best"}')
+          test "$code" = "400" || { echo "::error::expected 400, got $code"; exit 1; }
+
+          docker rm -f mm-ci

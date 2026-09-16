@@ -1,8 +1,10 @@
 services:
   media_manager:
-    image: bareth31/epsilon:media_manager
+    image: ghcr.io/bbareth/media_manager:latest
     container_name: media_manager
     ports:
+      # Bind to all interfaces only if you trust everything that can reach this
+      # host — there is no authentication. To keep it local, use "127.0.0.1:8080:8080".
       - "8080:8080"
     environment:
       # How long (seconds) downloaded/converted files live before auto-deletion.
@@ -17,16 +19,14 @@ services:
       # /var/lib/docker/volumes on the host — make sure THAT disk has space.
       - media_data:/data
       #
-      # Option B (recommended on Proxmox if the Docker root disk is small):
-      # bind-mount a folder on a disk with plenty of free space. Comment out
-      # the line above and uncomment the one below (create the folder first):
-      # - /mnt/media_manager_data:/data
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/api/health').read()==b'ok' else 1)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      # Option B: bind-mount a directory on a disk with plenty of free space.
+      # Recommended when the Docker root disk is small. Comment out the line
+      # above, uncomment the one below, and create the folder first.
+      # - /srv/media_manager_data:/data
+      #
+      # The container runs as uid 10001, so a bind-mounted directory has to be
+      # writable by it:  sudo chown -R 10001:10001 /srv/media_manager_data
+    # The image ships its own HEALTHCHECK; no need to repeat it here.
     restart: unless-stopped
 
 volumes:

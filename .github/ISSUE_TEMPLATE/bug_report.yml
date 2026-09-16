@@ -1,0 +1,62 @@
+name: Bug report
+description: Something behaves differently than documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If a **specific site** fails to download, check first whether `yt-dlp`
+        alone can fetch that URL. If it cannot, the fix belongs in yt-dlp.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the Compress tab
+        2. Upload a 2 GB MKV, target 25 MB
+        3. The job fails at 40 % with ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part
+      options: [Download, Transcode, Compress, UI, Deployment/Docker, Other]
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Image tag or commit SHA you are running.
+      placeholder: "ghcr.io/bbareth/media_manager:edge (or a commit SHA)"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Host
+      placeholder: "Docker 27 on Debian 12, x86_64 — or: built from source on macOS 15"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >
+        `docker logs media_manager`, plus the error text shown on the job.
+        Redact anything private first.
+      render: shell

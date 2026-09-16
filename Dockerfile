@@ -43,6 +43,17 @@ RUN apt-get update \
     && ln -s /opt/ytdlp/bin/yt-dlp /usr/local/bin/yt-dlp \
     && rm -rf /var/lib/apt/lists/*
 
+LABEL org.opencontainers.image.title="media_manager" \
+      org.opencontainers.image.description="Self-hosted download, transcode and size-targeted compression for media." \
+      org.opencontainers.image.source="https://github.com/BBareth/media_manager" \
+      org.opencontainers.image.licenses="MIT"
+
+# Nothing here needs root, and this container spends its time feeding untrusted
+# media to ffmpeg and yt-dlp. A fixed uid keeps bind-mounted data directories
+# predictable to chown from the host.
+RUN groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app
+
 WORKDIR /app
 COPY --from=backend /app/target/release/media_manager /app/media_manager
 COPY --from=frontend /app/frontend/dist /app/static
@@ -52,8 +63,13 @@ ENV MEDIA_DATA_DIR=/data \
     MEDIA_RETENTION_SECS=86400 \
     PORT=8080
 
-RUN mkdir -p /data
+RUN mkdir -p /data && chown -R app:app /data /app
 VOLUME ["/data"]
 EXPOSE 8080
+USER app
+
+# Honours $PORT rather than hard-coding 8080, so a remapped port stays healthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["python3", "-c", "import os,sys,urllib.request; p=os.environ.get('PORT','8080'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/api/health', timeout=3).read()==b'ok' else 1)"]
 
 CMD ["/app/media_manager"]
