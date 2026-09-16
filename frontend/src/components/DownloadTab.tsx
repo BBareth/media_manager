@@ -23,7 +23,7 @@ const QUALITIES = [
 export default function DownloadTab({ jobs, onChanged }: Props) {
   const [url, setUrl] = useState("");
   const [format, setFormat] = useState("mp4");
-  const [quality, setQuality] = useState("1080");
+  const [quality, setQuality] = useState("best");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 

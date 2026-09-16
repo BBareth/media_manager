@@ -70,38 +70,45 @@ impl AppState {
         }
     }
 
+    /// Take the lock, recovering it if a previous holder panicked.
+    ///
+    /// Every accessor here used to swallow a poisoned lock with `if let Ok(..)` or `.ok()`, which
+    /// turns one panic anywhere in one job into a process that silently stops recording progress
+    /// for *all* jobs, forever: every update becomes a no-op, the UI shows 0 % until the retention
+    /// sweep removes the row, and nothing is logged. The map holds plain data with no invariant a
+    /// panic could have broken half-way, so carrying on with it is both safe and the only useful
+    /// option — an unhelpful process is worse than a loud one.
+    fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<String, Job>> {
+        self.jobs.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("job map lock was poisoned by an earlier panic; continuing with it");
+            poisoned.into_inner()
+        })
+    }
+
     pub fn insert_job(&self, job: Job) {
-        if let Ok(mut map) = self.jobs.lock() {
-            map.insert(job.id.clone(), job);
-        }
+        self.jobs().insert(job.id.clone(), job);
     }
 
     pub fn get_job(&self, id: &str) -> Option<Job> {
-        self.jobs.lock().ok().and_then(|m| m.get(id).cloned())
+        self.jobs().get(id).cloned()
     }
 
     /// Apply a mutation to a job in place, if it still exists.
     pub fn update_job<F: FnOnce(&mut Job)>(&self, id: &str, f: F) {
-        if let Ok(mut map) = self.jobs.lock() {
-            if let Some(job) = map.get_mut(id) {
-                f(job);
-            }
+        if let Some(job) = self.jobs().get_mut(id) {
+            f(job);
         }
     }
 
     /// Jobs sorted newest-first.
     pub fn list_jobs(&self) -> Vec<Job> {
-        let mut jobs: Vec<Job> = self
-            .jobs
-            .lock()
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default();
-        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let mut jobs: Vec<Job> = self.jobs().values().cloned().collect();
+        jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
         jobs
     }
 
     pub fn remove_job(&self, id: &str) -> Option<Job> {
-        self.jobs.lock().ok().and_then(|mut m| m.remove(id))
+        self.jobs().remove(id)
     }
 
     /// Directory that holds all files for a given job.

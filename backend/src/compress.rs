@@ -11,9 +11,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::encode_plan::plan_encode;
 use crate::proc::run_with_progress;
 use crate::state::{AppState, Job, JobKind, JobStatus};
-use crate::transcode::{parse_ffmpeg_time, probe_duration};
+use crate::transcode::{parse_ffmpeg_time, probe_audio_streams, probe_duration, probe_video_shape};
 
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif"];
 
@@ -31,13 +32,17 @@ pub async fn start_compress(
     let id = Uuid::new_v4().to_string();
     let dir = state.job_dir(&id);
     if let Err(e) = fs::create_dir_all(&dir) {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir failed: {e}")));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("mkdir failed: {e}"),
+        ));
     }
 
     let mut target_mb: Option<f64> = None;
     let mut source_path: Option<PathBuf> = None;
     let mut original_name: Option<String> = None;
     let mut upload_size: u64 = 0;
+    let mut combine_audio = false;
 
     while let Some(mut field) = multipart
         .next_field()
@@ -51,6 +56,10 @@ pub async fn start_compress(
                     .await
                     .map_err(|e| bad(format!("could not read target_mb: {e}")))?;
                 target_mb = text.trim().parse::<f64>().ok();
+            }
+            Some("combine_audio") => {
+                let text = field.text().await.unwrap_or_default();
+                combine_audio = matches!(text.trim(), "true" | "1" | "on" | "yes");
             }
             Some("file") => {
                 let fname = field
@@ -86,7 +95,7 @@ pub async fn start_compress(
     }
 
     let target_mb = match target_mb {
-        Some(v) if v >= 0.1 && v <= 100_000.0 => v,
+        Some(v) if (0.1..=100_000.0).contains(&v) => v,
         Some(_) => {
             let _ = fs::remove_dir_all(&dir);
             return Err(bad("target_mb must be between 0.1 and 100000".into()));
@@ -121,7 +130,11 @@ pub async fn start_compress(
     // Videos always come out as mp4; images keep jpg/webp, everything else
     // becomes jpg (png at reduced quality would change format anyway).
     let out_ext = if is_image {
-        if ext == "webp" { "webp" } else { "jpg" }
+        if ext == "webp" {
+            "webp"
+        } else {
+            "jpg"
+        }
     } else {
         "mp4"
     };
@@ -134,11 +147,18 @@ pub async fn start_compress(
         status: JobStatus::Queued,
         progress: 0.0,
         title: original_name,
-        detail: format!(
-            "{:.1} MB → ≤ {} MB",
-            upload_size as f64 / (1024.0 * 1024.0),
-            trim_float(target_mb)
-        ),
+        detail: {
+            let base = format!(
+                "{:.1} MB → ≤ {} MB",
+                upload_size as f64 / (1024.0 * 1024.0),
+                trim_float(target_mb)
+            );
+            if combine_audio && !is_image {
+                format!("{base} · merge audio")
+            } else {
+                base
+            }
+        },
         output_name: None,
         output_size: None,
         error: None,
@@ -149,9 +169,24 @@ pub async fn start_compress(
     state.insert_job(job.clone());
 
     if is_image {
-        tokio::spawn(compress_image(state, id, source_path, output_path, output_name, target_bytes));
+        tokio::spawn(compress_image(
+            state,
+            id,
+            source_path,
+            output_path,
+            output_name,
+            target_bytes,
+        ));
     } else {
-        tokio::spawn(compress_video(state, id, source_path, output_path, output_name, target_bytes));
+        tokio::spawn(compress_video(
+            state,
+            id,
+            source_path,
+            output_path,
+            output_name,
+            target_bytes,
+            combine_audio,
+        ));
     }
 
     Ok(Json(job))
@@ -166,11 +201,32 @@ async fn compress_video(
     output: PathBuf,
     output_name: String,
     target_bytes: u64,
+    combine_audio: bool,
 ) {
     state.update_job(&id, |j| j.status = JobStatus::Running);
 
     let Some(duration) = probe_duration(&source).await.filter(|d| *d > 0.0) else {
-        return fail(&state, &id, "could not read media duration — is this a valid video file?".into());
+        return fail(
+            &state,
+            &id,
+            "could not read media duration — is this a valid video file?".into(),
+        );
+    };
+
+    // When asked, mix every audio stream into one track (e.g. ShadowPlay's
+    // separate game/mic tracks). Only meaningful with 2+ audio streams.
+    let audio_streams = if combine_audio {
+        probe_audio_streams(&source).await
+    } else {
+        0
+    };
+    let audio_filter = if audio_streams >= 2 {
+        let labels: String = (0..audio_streams).map(|i| format!("[0:a:{i}]")).collect();
+        Some(format!(
+            "{labels}amix=inputs={audio_streams}:duration=longest:normalize=0[aout]"
+        ))
+    } else {
+        None
     };
 
     let total_bps = (target_bytes as f64 * 8.0 * SIZE_MARGIN) / duration;
@@ -186,15 +242,42 @@ async fn compress_video(
     let video_kbps = format!("{}k", (video_bps / 1000.0) as u64);
     let audio_kbps = format!("{}k", (audio_bps / 1000.0) as u64);
 
+    // Decide what to encode before deciding how hard to work at it. Handing ffmpeg a 1440p60
+    // source when the budget only stretches to 0.007 bits per pixel is both the slowest and the
+    // ugliest option available; see encode_plan.rs for the measurements.
+    let (src_h, src_fps) = probe_video_shape(&source).await;
+    let plan = plan_encode(video_bps, src_h, src_fps);
+    let vf = plan.video_filter();
+    if let Some(ref f) = vf {
+        let note = f.clone();
+        state.update_job(&id, |j| {
+            j.detail = format!(
+                "{} · {}",
+                j.detail,
+                note.replace("scale=-2:", "").replace(",fps=", "p @ ")
+            )
+        });
+    }
+
     let passlog = source.with_file_name("ffmpeg2pass");
     let passlog_arg = passlog.to_string_lossy().to_string();
 
     // Pass 1: analysis only, no audio, output discarded.
     let mut pass1 = Command::new("ffmpeg");
+    pass1.arg("-y").arg("-i").arg(&source);
+    // Both passes must see the same frames, or pass 2's statistics describe a different video.
+    if let Some(ref f) = vf {
+        pass1.args(["-vf", f]);
+    }
     pass1
-        .arg("-y")
-        .arg("-i").arg(&source)
-        .args(["-c:v", "libx264", "-preset", "medium", "-b:v", &video_kbps])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            plan.preset,
+            "-b:v",
+            &video_kbps,
+        ])
         .args(["-pass", "1", "-passlogfile", &passlog_arg])
         .args(["-an", "-f", "mp4", "-progress", "pipe:1", "-nostats"])
         .arg("/dev/null");
@@ -205,7 +288,11 @@ async fn compress_video(
         if let Some(v) = line.strip_prefix("out_time=") {
             if let Some(cur) = parse_ffmpeg_time(v) {
                 let pct = ((cur / duration) * 50.0).clamp(0.0, 50.0) as f32;
-                st.update_job(&jid, |j| if pct > j.progress { j.progress = pct });
+                st.update_job(&jid, |j| {
+                    if pct > j.progress {
+                        j.progress = pct
+                    }
+                });
             }
         }
     })
@@ -218,11 +305,34 @@ async fn compress_video(
 
     // Pass 2: real encode with audio.
     let mut pass2 = Command::new("ffmpeg");
+    pass2.arg("-y").arg("-i").arg(&source);
+    // -vf and -filter_complex cannot both be given, so when the audio streams are being mixed
+    // the scaling has to move into the complex graph alongside them.
+    if let (Some(v), None) = (&vf, &audio_filter) {
+        pass2.args(["-vf", v]);
+    }
     pass2
-        .arg("-y")
-        .arg("-i").arg(&source)
-        .args(["-c:v", "libx264", "-preset", "medium", "-b:v", &video_kbps])
-        .args(["-pass", "2", "-passlogfile", &passlog_arg])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            plan.preset,
+            "-b:v",
+            &video_kbps,
+        ])
+        .args(["-pass", "2", "-passlogfile", &passlog_arg]);
+    if let Some(ref filter) = audio_filter {
+        // Map the original video plus the single mixed-down audio track.
+        let graph = match &vf {
+            Some(v) => format!("[0:v:0]{v}[vout];{filter}"),
+            None => filter.clone(),
+        };
+        let vmap = if vf.is_some() { "[vout]" } else { "0:v:0" };
+        pass2
+            .args(["-filter_complex", &graph])
+            .args(["-map", vmap, "-map", "[aout]"]);
+    }
+    pass2
         .args(["-c:a", "aac", "-b:a", &audio_kbps])
         .args(["-pix_fmt", "yuv420p", "-movflags", "+faststart"])
         .args(["-progress", "pipe:1", "-nostats"])
@@ -234,7 +344,11 @@ async fn compress_video(
         if let Some(v) = line.strip_prefix("out_time=") {
             if let Some(cur) = parse_ffmpeg_time(v) {
                 let pct = (50.0 + (cur / duration) * 50.0).clamp(50.0, 99.0) as f32;
-                st.update_job(&jid, |j| if pct > j.progress { j.progress = pct });
+                st.update_job(&jid, |j| {
+                    if pct > j.progress {
+                        j.progress = pct
+                    }
+                });
             }
         }
     })
@@ -335,7 +449,11 @@ fn fail(state: &AppState, id: &str, msg: String) {
 }
 
 fn pick_err(tail: String, fallback: &str) -> String {
-    if tail.is_empty() { fallback.to_string() } else { tail }
+    if tail.is_empty() {
+        fallback.to_string()
+    } else {
+        tail
+    }
 }
 
 /// "25" instead of "25.0", but keep "2.5".
