@@ -3,6 +3,11 @@
 **/target
 **/data
 .git
+.github
+.claude
 *.md
 .gitignore
+.gitattributes
+.editorconfig
 docker-compose.yml
+LICENSE
