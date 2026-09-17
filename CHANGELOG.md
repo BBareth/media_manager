@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-17
+
 ### Changed
 
 - The frontend moves to React 19, Vite 8 and TypeScript 7. No behaviour
@@ -52,5 +54,6 @@ First public release.
   directory must be writable by that uid —
   `sudo chown -R 10001:10001 <dir>`. Named volumes need nothing.
 
-[Unreleased]: https://github.com/BBareth/media_manager/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/BBareth/media_manager/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/BBareth/media_manager/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/BBareth/media_manager/releases/tag/v0.1.0

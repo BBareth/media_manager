@@ -94,7 +94,7 @@ docker compose up -d
 | Tag            | What it is                                           |
 | -------------- | ---------------------------------------------------- |
 | `latest`       | The newest tagged release. Use this.                 |
-| `0.1.0`, `0.1` | A specific release, pinned.                          |
+| `0.1.1`, `0.1` | A specific release, pinned.                          |
 | `edge`         | Built from `main` on every push. Expect rough edges. |
 
 Images are published for `linux/amd64` and `linux/arm64`.
