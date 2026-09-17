@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./docs/logo.svg" width="96" height="96" alt="">
+</p>
+
 <h1 align="center">media_manager</h1>
 
 <p align="center">
