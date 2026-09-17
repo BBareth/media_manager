@@ -22,12 +22,12 @@ Three things, one container, no accounts and no library to curate:
   quality ceiling up to 4K.
 - **Transcode** — convert an uploaded file to another format with `ffmpeg`.
   AVI → MP4, MKV → MP4, MP3 → OGG, and anything else ffmpeg can do here.
-- **Compress** — give it a target size in megabytes and it aims just under it,
-  with 3 % of headroom for container overhead. Videos are re-encoded at a
-  resolution and frame rate the target bitrate can actually support
-  ([why that matters](#why-compression-changes-the-resolution));
-  images (JPG, PNG, WebP, BMP, TIFF) step down in quality, and in resolution if
-  that is not enough. Select several files to queue them.
+- **Compress** — give it a target size in megabytes and it gets under it.
+  Videos are re-encoded at a resolution and frame rate the target bitrate can
+  actually support ([why that matters](#why-compression-changes-the-resolution)),
+  then measured and encoded again if they came out over anyway; images (JPG,
+  PNG, WebP, BMP, TIFF) step down in quality, and in resolution if that is not
+  enough. Select several files to queue them.
 
 Finished files are yours to pull straight to the browser. Everything on the
 server is transient: anything older than the retention window (one day by
