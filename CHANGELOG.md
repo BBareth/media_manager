@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The frontend moves to React 19, Vite 8 and TypeScript 7. No behaviour
+  changes; the production bundle grows from 156 kB to 233 kB (50 kB to 73 kB
+  gzipped), which is React 19's runtime.
+
+### Fixed
+
+- Video compression could finish above its target — an 8 s 720p source asked
+  for 0.5 MB came back at 0.52 MB, because x264 does not promise to hit the
+  bitrate it is given and the flat 3 % margin did not cover it. The encode is
+  now measured and repeated at a corrected bitrate when it lands over, up to
+  three attempts, reusing the first pass so a retry costs one encode rather
+  than two. A target that cannot be reached fails with how close it got
+  instead of quietly handing back an oversized file.
+
 ## [0.1.0] - 2026-09-17
 
 First public release.

@@ -22,6 +22,14 @@ const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif"
 /// doesn't push the result past the target.
 const SIZE_MARGIN: f64 = 0.97;
 
+/// Below this a re-encode stops being worth delivering, so it is where the
+/// search gives up rather than a number to creep past.
+const MIN_VIDEO_BPS: f64 = 40_000.0;
+
+/// How many times pass 2 may run. The first attempt is the common case; the
+/// retries exist for sources where x264 overshoots its requested bitrate.
+const MAX_PASS2_ATTEMPTS: usize = 3;
+
 /// POST /api/compress — multipart upload with a `target_mb` field and a
 /// `file`. Videos are re-encoded with a bitrate computed to land under the
 /// target (two-pass x264); images are searched down in quality/scale.
@@ -238,7 +246,7 @@ async fn compress_video(
     } else {
         64_000.0
     };
-    let video_bps = (total_bps - audio_bps).max(40_000.0);
+    let video_bps = (total_bps - audio_bps).max(MIN_VIDEO_BPS);
     let video_kbps = format!("{}k", (video_bps / 1000.0) as u64);
     let audio_kbps = format!("{}k", (audio_bps / 1000.0) as u64);
 
@@ -287,7 +295,7 @@ async fn compress_video(
     let r1 = run_with_progress(&mut pass1, |line| {
         if let Some(v) = line.strip_prefix("out_time=") {
             if let Some(cur) = parse_ffmpeg_time(v) {
-                let pct = ((cur / duration) * 50.0).clamp(0.0, 50.0) as f32;
+                let pct = ((cur / duration) * 40.0).clamp(0.0, 40.0) as f32;
                 st.update_job(&jid, |j| {
                     if pct > j.progress {
                         j.progress = pct
@@ -299,73 +307,149 @@ async fn compress_video(
     .await;
     match r1 {
         Ok(r) if r.success => {}
-        Ok(r) => return fail(&state, &id, pick_err(r.error_tail, "ffmpeg pass 1 failed")),
-        Err(e) => return fail(&state, &id, format!("failed to run ffmpeg: {e}")),
+        Ok(r) => {
+            clear_passlog(&source);
+            return fail(&state, &id, pick_err(r.error_tail, "ffmpeg pass 1 failed"));
+        }
+        Err(e) => {
+            clear_passlog(&source);
+            return fail(&state, &id, format!("failed to run ffmpeg: {e}"));
+        }
     }
 
-    // Pass 2: real encode with audio.
-    let mut pass2 = Command::new("ffmpeg");
-    pass2.arg("-y").arg("-i").arg(&source);
-    // -vf and -filter_complex cannot both be given, so when the audio streams are being mixed
-    // the scaling has to move into the complex graph alongside them.
-    if let (Some(v), None) = (&vf, &audio_filter) {
-        pass2.args(["-vf", v]);
-    }
-    pass2
-        .args([
-            "-c:v",
-            "libx264",
-            "-preset",
-            plan.preset,
-            "-b:v",
-            &video_kbps,
-        ])
-        .args(["-pass", "2", "-passlogfile", &passlog_arg]);
-    if let Some(ref filter) = audio_filter {
-        // Map the original video plus the single mixed-down audio track.
-        let graph = match &vf {
-            Some(v) => format!("[0:v:0]{v}[vout];{filter}"),
-            None => filter.clone(),
-        };
-        let vmap = if vf.is_some() { "[vout]" } else { "0:v:0" };
+    // Pass 2, repeated if what comes out is still too big.
+    //
+    // x264 aims at the bitrate it is given but does not promise to hit it, and
+    // on a short clip it has few frames to converge over while the container
+    // overhead is proportionally large. SIZE_MARGIN alone does not cover that,
+    // and a size target is usually a hard upload limit — a file 4 % over is as
+    // rejected as one twice the size. So measure the result and encode again at
+    // a corrected bitrate. Only pass 2 repeats: the pass-1 log describes the
+    // source rather than the bitrate, which is the whole premise of multi-pass.
+    const BANDS: [(f32, f32); MAX_PASS2_ATTEMPTS] = [(40.0, 80.0), (80.0, 90.0), (90.0, 99.0)];
+
+    let base_detail = state.get_job(&id).map(|j| j.detail).unwrap_or_default();
+    let mut attempt_bps = video_bps;
+    let mut closest: Option<u64> = None;
+
+    for (attempt, (band_lo, band_hi)) in BANDS.iter().copied().enumerate() {
+        let video_kbps = format!("{}k", (attempt_bps / 1000.0) as u64);
+
+        let mut pass2 = Command::new("ffmpeg");
+        pass2.arg("-y").arg("-i").arg(&source);
+        // -vf and -filter_complex cannot both be given, so when the audio streams are being mixed
+        // the scaling has to move into the complex graph alongside them.
+        if let (Some(v), None) = (&vf, &audio_filter) {
+            pass2.args(["-vf", v]);
+        }
         pass2
-            .args(["-filter_complex", &graph])
-            .args(["-map", vmap, "-map", "[aout]"]);
-    }
-    pass2
-        .args(["-c:a", "aac", "-b:a", &audio_kbps])
-        .args(["-pix_fmt", "yuv420p", "-movflags", "+faststart"])
-        .args(["-progress", "pipe:1", "-nostats"])
-        .arg(&output);
+            .args([
+                "-c:v",
+                "libx264",
+                "-preset",
+                plan.preset,
+                "-b:v",
+                &video_kbps,
+            ])
+            .args(["-pass", "2", "-passlogfile", &passlog_arg]);
+        if let Some(ref filter) = audio_filter {
+            // Map the original video plus the single mixed-down audio track.
+            let graph = match &vf {
+                Some(v) => format!("[0:v:0]{v}[vout];{filter}"),
+                None => filter.clone(),
+            };
+            let vmap = if vf.is_some() { "[vout]" } else { "0:v:0" };
+            pass2
+                .args(["-filter_complex", &graph])
+                .args(["-map", vmap, "-map", "[aout]"]);
+        }
+        pass2
+            .args(["-c:a", "aac", "-b:a", &audio_kbps])
+            .args(["-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+            .args(["-progress", "pipe:1", "-nostats"])
+            .arg(&output);
 
-    let st = state.clone();
-    let jid = id.clone();
-    let r2 = run_with_progress(&mut pass2, |line| {
-        if let Some(v) = line.strip_prefix("out_time=") {
-            if let Some(cur) = parse_ffmpeg_time(v) {
-                let pct = (50.0 + (cur / duration) * 50.0).clamp(50.0, 99.0) as f32;
-                st.update_job(&jid, |j| {
-                    if pct > j.progress {
-                        j.progress = pct
-                    }
-                });
+        let st = state.clone();
+        let jid = id.clone();
+        let span = band_hi - band_lo;
+        let r2 = run_with_progress(&mut pass2, move |line| {
+            if let Some(v) = line.strip_prefix("out_time=") {
+                if let Some(cur) = parse_ffmpeg_time(v) {
+                    let pct = (band_lo + (cur / duration) as f32 * span).clamp(band_lo, band_hi);
+                    st.update_job(&jid, |j| {
+                        if pct > j.progress {
+                            j.progress = pct
+                        }
+                    });
+                }
+            }
+        })
+        .await;
+
+        match r2 {
+            Ok(r) if r.success && output.is_file() => {}
+            Ok(r) => {
+                clear_passlog(&source);
+                return fail(&state, &id, pick_err(r.error_tail, "ffmpeg pass 2 failed"));
+            }
+            Err(e) => {
+                clear_passlog(&source);
+                return fail(&state, &id, format!("failed to run ffmpeg: {e}"));
             }
         }
-    })
-    .await;
 
-    // Pass logs are scratch; remove them regardless of outcome.
-    for suffix in ["-0.log", "-0.log.mbtree"] {
-        let _ = fs::remove_file(source.with_file_name(format!("ffmpeg2pass{suffix}")));
+        let size = fs::metadata(&output).map(|m| m.len()).unwrap_or(u64::MAX);
+        if size <= target_bytes {
+            clear_passlog(&source);
+            let _ = fs::remove_file(&source);
+            return finish(&state, &id, output, output_name);
+        }
+        closest = Some(closest.map_or(size, |best: u64| best.min(size)));
+
+        let next_bps = retry_video_bps(attempt_bps, duration, size, target_bytes);
+        // At the floor there is nothing left to give up, so stop rather than
+        // spend another whole encode producing the same file.
+        if next_bps >= attempt_bps || next_bps <= MIN_VIDEO_BPS {
+            break;
+        }
+        attempt_bps = next_bps;
+        state.update_job(&id, |j| {
+            j.detail = format!("{base_detail} · retry {}", attempt + 1)
+        });
     }
 
-    match r2 {
-        Ok(r) if r.success && output.is_file() => {
-            let _ = fs::remove_file(&source);
-            finish(&state, &id, output, output_name);
-        }
-        Ok(r) => fail(&state, &id, pick_err(r.error_tail, "ffmpeg pass 2 failed")),
-        Err(e) => fail(&state, &id, format!("failed to run ffmpeg: {e}")),
+    clear_passlog(&source);
+    let closest_mb = closest.unwrap_or(0) as f64 / (1024.0 * 1024.0);
+    let target_mb = target_bytes as f64 / (1024.0 * 1024.0);
+    fail(
+        &state,
+        &id,
+        format!(
+            "could not get this under {target_mb:.1} MB — the closest was {closest_mb:.1} MB. Try a larger target."
+        ),
+    );
+}
+
+/// Bitrate to aim at next when an encode landed over target.
+///
+/// Correcting by the overall ratio would under-correct every time: the audio
+/// track, the container and the moov atom do not shrink when the video bitrate
+/// does. Estimate that fixed part from what the last attempt asked for, take it
+/// off the target, and solve for the video bitrate that is actually left.
+fn retry_video_bps(previous_bps: f64, duration: f64, actual_bytes: u64, target_bytes: u64) -> f64 {
+    if duration <= 0.0 || !previous_bps.is_finite() {
+        return MIN_VIDEO_BPS;
+    }
+    let video_bytes = previous_bps * duration / 8.0;
+    let fixed_bytes = (actual_bytes as f64 - video_bytes).max(0.0);
+    let budget_bytes = target_bytes as f64 * SIZE_MARGIN - fixed_bytes;
+    ((budget_bytes * 8.0) / duration).max(MIN_VIDEO_BPS)
+}
+
+/// Pass logs are scratch; remove them whatever the outcome.
+fn clear_passlog(source: &Path) {
+    for suffix in ["-0.log", "-0.log.mbtree"] {
+        let _ = fs::remove_file(source.with_file_name(format!("ffmpeg2pass{suffix}")));
     }
 }
 
@@ -471,4 +555,72 @@ fn bad(msg: String) -> (StatusCode, String) {
 
 fn internal(msg: String) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MB: f64 = 1024.0 * 1024.0;
+
+    /// The case that prompted this: an 8 s clip asked for 0.5 MB came back at
+    /// 0.52 MB. The next attempt has to aim meaningfully lower.
+    #[test]
+    fn an_overshoot_lowers_the_bitrate() {
+        let duration = 8.0;
+        let previous = 470_000.0;
+        let next = retry_video_bps(previous, duration, 545_880, (0.5 * MB) as u64);
+        assert!(next < previous, "{next} should be below {previous}");
+        assert!(
+            next > MIN_VIDEO_BPS,
+            "a 4 % overshoot is not a hopeless one"
+        );
+    }
+
+    /// Scaling the video bitrate by the overall ratio always under-corrects,
+    /// because the audio and the container do not shrink with it. The
+    /// correction has to be sharper than that to be worth an extra encode.
+    #[test]
+    fn it_corrects_harder_than_the_naive_ratio() {
+        let duration = 60.0;
+        let previous = 1_000_000.0;
+        let actual = 12_582_912; // 12 MB
+        let target = 10 * 1024 * 1024; // 10 MB
+
+        let naive = previous * (target as f64 / actual as f64);
+        let next = retry_video_bps(previous, duration, actual, target);
+        assert!(next < naive, "{next} should undercut the naive {naive}");
+    }
+
+    /// A target no bitrate can reach lands on the floor, which is the signal
+    /// the caller uses to stop retrying.
+    #[test]
+    fn an_impossible_target_lands_on_the_floor() {
+        // 0.1 MB for ten minutes of video, where the audio alone already
+        // exceeds the target.
+        let next = retry_video_bps(200_000.0, 600.0, 9_000_000, (0.1 * MB) as u64);
+        assert_eq!(next, MIN_VIDEO_BPS);
+    }
+
+    #[test]
+    fn a_zero_duration_cannot_divide_by_zero() {
+        assert_eq!(retry_video_bps(500_000.0, 0.0, 1_000, 500), MIN_VIDEO_BPS);
+        assert_eq!(retry_video_bps(f64::NAN, 10.0, 1_000, 500), MIN_VIDEO_BPS);
+    }
+
+    /// Each attempt must move, or the retry budget is spent re-encoding the
+    /// same file at the same bitrate.
+    #[test]
+    fn successive_attempts_keep_descending() {
+        let duration = 30.0;
+        let mut bps = 2_000_000.0;
+        let target = (5.0 * MB) as u64;
+        // Pretend every attempt lands 20 % over.
+        for _ in 0..3 {
+            let actual = (target as f64 * 1.2) as u64;
+            let next = retry_video_bps(bps, duration, actual, target);
+            assert!(next < bps, "{next} should be below {bps}");
+            bps = next;
+        }
+    }
 }
