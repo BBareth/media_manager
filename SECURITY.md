@@ -40,9 +40,15 @@ Where an attack is cheap to prevent, it is prevented:
 - Each job writes only inside its own UUID-named directory, and outputs are
   served from a path recorded server-side rather than from anything in the
   request.
-- Filenames from uploads and from remote metadata are never used to build the
-  path that is written to; they only become a `Content-Disposition` suggestion,
-  escaped for that header.
+- Filenames from uploads are never used to build a path: uploads and outputs
+  are written under fixed names, and the original name only becomes a
+  `Content-Disposition` suggestion, escaped for that header. Downloads are named
+  after the page title by `yt-dlp`'s own filename sanitiser, capped at 200
+  bytes, inside the job's directory.
+- Finished files are only ever shown inline (`?inline=true`) when they are
+  audio, video or a raster image, and are always sent with
+  `X-Content-Type-Options: nosniff`, so a hostile download cannot run as a page
+  on this origin.
 
 ## Supported versions
 

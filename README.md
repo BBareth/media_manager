@@ -24,31 +24,37 @@ Three things, one container, no accounts and no library to curate:
   sites `yt-dlp` supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
   Choose the container (MP4, MKV, WebM, MP3, M4A, OPUS, OGG, WAV, FLAC) and a
   quality ceiling up to 4K.
-- **Transcode** — convert an uploaded file to another format with `ffmpeg`.
-  AVI → MP4, MKV → MP4, MP3 → OGG, and anything else ffmpeg can do here.
+- **Convert** — change an uploaded file's format with `ffmpeg`. AVI → MP4,
+  MKV → MP4, WAV → MP3, and anything else ffmpeg can do here. When the streams
+  already suit the new container they are copied rather than re-encoded, so an
+  OBS recording goes from MKV to MP4 in a fraction of a second, losslessly.
 - **Compress** — give it a target size in megabytes and it gets under it.
   Videos are re-encoded at a resolution and frame rate the target bitrate can
   actually support ([why that matters](#why-compression-changes-the-resolution)),
-  then measured and encoded again if they came out over anyway; images (JPG,
-  PNG, WebP, BMP, TIFF) step down in quality, and in resolution if that is not
-  enough. Select several files to queue them.
+  then measured and encoded again if they came out over anyway; audio becomes
+  AAC at the bitrate the size allows; images (JPG, PNG, WebP, BMP, TIFF) step
+  down in quality, and shrink before the quality drops too far.
+
+Select several files to queue them. Progress updates live, with an estimate of
+the time left; finished files can be previewed in the browser; a running job
+can be cancelled, which stops its encoder there and then.
 
 Finished files are yours to pull straight to the browser. Everything on the
 server is transient: anything older than the retention window (one day by
 default) is deleted automatically, so the disk never fills up.
 
-Transcode and Compress can also **merge separate audio tracks into one**, which
+Convert and Compress can also **merge separate audio tracks into one**, which
 is what you want for recordings that keep game and microphone audio apart —
 ShadowPlay, OBS multi-track, and similar.
 
 <p align="center">
-  <img src="./docs/screenshot.png" alt="The Download tab: a URL field, format and quality selectors, and the job list below." width="820">
+  <img src="./docs/screenshot.png" alt="The Convert tab: a file picker and format choices, with a running WebM conversion showing its time left and two finished files ready to download or preview." width="820">
   <br>
-  <em>Paste a URL, pick a format, done.</em>
+  <em>Drop in files, pick a format. An MKV that is already H.264 becomes an MP4 without re-encoding.</em>
   <br><br>
-  <img src="./docs/screenshot-compress.png" alt="The Compress tab: a drag-and-drop file picker, a target size in megabytes, and an option to combine audio tracks." width="820">
+  <img src="./docs/screenshot-compress.png" alt="The Compress tab: a file picker, a target size with one-click presets, and a video being fitted under 10 MB next to a finished image." width="820">
   <br>
-  <em>Or drop in files and name a size to land under.</em>
+  <em>Or name a size to land under.</em>
 </p>
 
 > [!WARNING]
@@ -107,6 +113,8 @@ Everything is an environment variable; there is no config file.
 | ---------------------- | -------------------- | ----------------------------------------------- |
 | `PORT`                 | `8080`               | HTTP port inside the container.                 |
 | `MEDIA_RETENTION_SECS` | `86400` (1 day)      | Age at which files and job records are deleted. |
+| `MEDIA_MAX_ENCODES`    | `2`                  | Conversions and compressions that run at once; the rest queue. |
+| `MEDIA_MAX_DOWNLOADS`  | `3`                  | Downloads that run at once; the rest queue.     |
 | `MEDIA_DATA_DIR`       | `/data`              | Working files. Mount a volume here.             |
 | `MEDIA_STATIC_DIR`     | `/app/static`        | Built frontend assets. Set inside the image.    |
 | `RUST_LOG`             | `media_manager=info` | Log filter, in `tracing` syntax.                |
@@ -130,14 +138,19 @@ sudo chown -R 10001:10001 /srv/media_manager_data
   No component library and no state manager.
 - **Media tools** — `yt-dlp` and `ffmpeg`, bundled in the image.
 
-Each job gets a UUID-named folder under `/data`. Downloads run `yt-dlp` with a
-format selector derived from your quality choice. Transcodes stream the upload
-to disk, probe its duration with `ffprobe` so the progress bar is real rather
-than a guess, and then run `ffmpeg`. The frontend polls `/api/jobs` for
-progress, and a sweep every 30 minutes deletes anything past its retention age,
-including stray folders left by earlier runs.
+Each job gets a UUID-named folder under `/data`. Downloads run `yt-dlp`, which
+picks the best format at or under your quality ceiling. Conversions stream the
+upload to disk, probe it once with `ffprobe` — the duration makes the progress
+bar real rather than a guess, the codecs decide what can be copied — and then
+run `ffmpeg`. Jobs wait as *queued* until a slot is free: x264 already uses
+every core, so running more encodes at once only makes every result late.
+The frontend receives progress as server-sent events from `/api/events`, and a
+sweep every 30 minutes deletes anything past its retention age, including stray
+folders left by earlier runs. Deleting a job that is still running stops its
+`ffmpeg` or `yt-dlp` process.
 
-`yt-dlp` is installed from PyPI into a virtualenv rather than used as the
+`yt-dlp` is installed from PyPI into a virtualenv, together with the Deno
+JavaScript runtime it needs for YouTube, rather than used as the
 standalone binary, which self-extracts at runtime and fails on hosts with a
 small `/tmp`.
 
@@ -185,13 +198,15 @@ The frontend is an ordinary client of this; nothing is privileged.
 | Method   | Path                  | Body                            | Purpose                       |
 | -------- | --------------------- | ------------------------------- | ----------------------------- |
 | `GET`    | `/api/health`         | —                               | Returns `ok`.                 |
+| `GET`    | `/api/info`           | —                               | Retention and concurrency settings. |
+| `GET`    | `/api/events`         | —                               | Server-sent events: the job list on connect and after every change. |
 | `POST`   | `/api/downloads`      | JSON `{ url, format, quality }` | Start a download.             |
 | `POST`   | `/api/transcode`      | multipart `file`, `format`, `combine_audio` | Start a conversion. |
 | `POST`   | `/api/compress`       | multipart `file`, `target_mb`, `combine_audio` | Start a size-targeted encode. |
 | `GET`    | `/api/jobs`           | —                               | Every job, newest first.      |
 | `GET`    | `/api/jobs/{id}`      | —                               | One job.                      |
-| `GET`    | `/api/jobs/{id}/file` | —                               | Stream the finished output.   |
-| `DELETE` | `/api/jobs/{id}`      | —                               | Delete a job and its files.   |
+| `GET`    | `/api/jobs/{id}/file` | —                               | The finished output. Supports `Range`; `?inline=true` asks for it to be shown rather than saved (media types only). |
+| `DELETE` | `/api/jobs/{id}`      | —                               | Stop a job if it is running, and delete it and its files. |
 
 ```bash
 curl -X POST http://localhost:8080/api/downloads \
