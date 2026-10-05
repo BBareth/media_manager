@@ -98,6 +98,12 @@ jobs:
           docker run --rm media_manager:ci ffmpeg -version | head -n 1
           docker run --rm media_manager:ci ffprobe -version | head -n 1
 
+          # YouTube needs a JavaScript runtime; make sure yt-dlp can see the bundled one.
+          # `yt-dlp -v` with no URL prints its debug header and then exits non-zero.
+          docker run --rm media_manager:ci yt-dlp -v > /tmp/ytdlp-debug.txt 2>&1 || true
+          grep -q 'JS runtimes: deno' /tmp/ytdlp-debug.txt \
+            || { echo "::error::yt-dlp found no JavaScript runtime"; cat /tmp/ytdlp-debug.txt; exit 1; }
+
           docker run -d --name mm-ci -p 8080:8080 media_manager:ci
 
           # Poll rather than sleep a fixed amount: fast when it is fast,
@@ -117,6 +123,12 @@ jobs:
 
           # The SPA itself must be served, not just the API.
           curl -fsS http://localhost:8080/ | grep -qi '<div id="root">'
+
+          # Live job updates: the stream sends the job list as soon as it opens. It never
+          # ends on its own, so curl is cut off by its timeout, which is expected.
+          curl -s -N --max-time 2 http://localhost:8080/api/events > /tmp/events.txt || true
+          grep -q '^event: jobs' /tmp/events.txt \
+            || { echo "::error::/api/events sent no job list"; cat /tmp/events.txt; exit 1; }
 
           # A rejected scheme should not start a job (see SECURITY.md).
           code=$(curl -s -o /dev/null -w '%{http_code}' \

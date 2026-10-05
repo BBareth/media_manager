@@ -3,10 +3,15 @@
 # ---- Stage 1: build the TypeScript/React frontend ----
 FROM node:26-slim AS frontend
 WORKDIR /app/frontend
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm install
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
-RUN npm run build
+# Pre-compress the bundle once here, so the server can hand gzip to browsers that
+# accept it (253 kB of JavaScript goes over the wire as 79 kB) without compressing
+# on every request.
+RUN npm run build \
+    && find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.svg' \) \
+         -exec gzip -9 --keep {} +
 
 # ---- Stage 2: build the Rust backend ----
 FROM rust:1-slim-bookworm AS backend
@@ -26,6 +31,10 @@ FROM debian:bookworm-slim AS runtime
 # yt-dlp is installed from PyPI into an isolated venv and runs on real Python.
 # This avoids the fragile self-extraction the standalone PyInstaller binary does
 # at runtime (which fails on constrained /tmp with "decompression returned -1").
+#
+# The `deno` extra brings the JavaScript runtime yt-dlp needs to answer YouTube's
+# challenges; without one, YouTube downloads fail or are limited to a few formats.
+# It is yt-dlp's own packaging of Deno, with wheels for amd64 and arm64.
 ARG YTDLP_VERSION=latest
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -36,11 +45,12 @@ RUN apt-get update \
     && python3 -m venv /opt/ytdlp \
     && /opt/ytdlp/bin/pip install --no-cache-dir --upgrade pip \
     && if [ "$YTDLP_VERSION" = "latest" ]; then \
-         /opt/ytdlp/bin/pip install --no-cache-dir --upgrade "yt-dlp[default]"; \
+         /opt/ytdlp/bin/pip install --no-cache-dir --upgrade "yt-dlp[default,deno]"; \
        else \
-         /opt/ytdlp/bin/pip install --no-cache-dir "yt-dlp[default]==${YTDLP_VERSION}"; \
+         /opt/ytdlp/bin/pip install --no-cache-dir "yt-dlp[default,deno]==${YTDLP_VERSION}"; \
        fi \
     && ln -s /opt/ytdlp/bin/yt-dlp /usr/local/bin/yt-dlp \
+    && ln -s /opt/ytdlp/bin/deno /usr/local/bin/deno \
     && rm -rf /var/lib/apt/lists/*
 
 LABEL org.opencontainers.image.title="media_manager" \
