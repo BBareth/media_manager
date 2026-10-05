@@ -14,25 +14,23 @@ pub async fn run_cleanup(state: AppState) {
     // First sweep shortly after boot to clear anything left from a previous run.
     tokio::time::sleep(Duration::from_secs(10)).await;
     loop {
-        sweep(&state);
+        // Deleting a day's worth of media is slow, blocking filesystem work; keep it off the
+        // threads that serve requests.
+        let st = state.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || sweep(&st)).await {
+            tracing::error!("cleanup sweep panicked: {e}");
+        }
         tokio::time::sleep(SWEEP_INTERVAL).await;
     }
 }
 
 fn sweep(state: &AppState) {
-    let now = Utc::now().timestamp();
-    let cutoff = now - state.retention_secs;
+    let cutoff = Utc::now().timestamp() - state.retention_secs;
 
-    // 1. Expire tracked jobs by their creation time.
-    let expired: Vec<String> = {
-        let Ok(map) = state.jobs.lock() else { return };
-        map.values()
-            .filter(|j| j.created_at < cutoff)
-            .map(|j| j.id.clone())
-            .collect()
-    };
-    for id in &expired {
-        if let Some(job) = state.remove_job(id) {
+    // 1. Expire tracked jobs by their creation time. Removing one that is somehow still running
+    //    stops it, too.
+    for id in state.created_before(cutoff) {
+        if let Some(job) = state.remove_job(&id) {
             let _ = fs::remove_dir_all(&job.dir);
             tracing::info!(job = %id, "cleanup: removed expired job");
         }
@@ -51,7 +49,7 @@ fn sweep(state: &AppState) {
         }
         // Skip directories still tracked as active jobs.
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if state.get_job(name).is_some() {
+            if state.is_tracked(name) {
                 continue;
             }
         }

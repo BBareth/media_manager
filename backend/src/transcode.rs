@@ -1,18 +1,15 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use axum::{
     extract::{Multipart, State},
-    http::StatusCode,
     Json,
 };
-use chrono::Utc;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use uuid::Uuid;
 
-use crate::proc::run_with_progress;
-use crate::state::{AppState, Job, JobKind, JobStatus};
+use crate::probe::{probe, MediaInfo, VideoStream};
+use crate::proc::{out_time, run_with_progress};
+use crate::state::{AppState, Job, JobKind};
+use crate::upload::{self, bad, multipart_error, ApiError, JobDir};
 
 const TARGET_FORMATS: &[&str] = &[
     // video containers
@@ -25,118 +22,66 @@ const TARGET_FORMATS: &[&str] = &[
 pub async fn start_transcode(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<Job>, (StatusCode, String)> {
-    let id = Uuid::new_v4().to_string();
-    let dir = state.job_dir(&id);
-    if let Err(e) = fs::create_dir_all(&dir) {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("mkdir failed: {e}"),
-        ));
-    }
+) -> Result<Json<Job>, ApiError> {
+    let dir = JobDir::create(&state)?;
 
-    let mut target_format: Option<String> = None;
-    let mut source_path: Option<PathBuf> = None;
-    let mut original_name: Option<String> = None;
+    let mut target: Option<String> = None;
     let mut combine_audio = false;
+    let mut upload = None;
 
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| bad(format!("invalid multipart body: {e}")))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(multipart_error)? {
         match field.name() {
             Some("format") => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| bad(format!("could not read format field: {e}")))?;
-                target_format = Some(text.trim().to_lowercase());
-            }
-            Some("combine_audio") => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| bad(format!("could not read combine_audio field: {e}")))?;
-                combine_audio = text.trim().eq_ignore_ascii_case("true");
-            }
-            Some("file") => {
-                let fname = field
-                    .file_name()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "upload".to_string());
-                original_name = Some(fname.clone());
-                let ext = Path::new(&fname)
-                    .extension()
-                    .map(|e| e.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "bin".to_string());
-                let src = dir.join(format!("source.{ext}"));
-                let mut file = tokio::fs::File::create(&src)
-                    .await
-                    .map_err(|e| internal(format!("cannot create upload file: {e}")))?;
-                while let Some(chunk) = field
-                    .chunk()
-                    .await
-                    .map_err(|e| internal(format!("upload stream error: {e}")))?
-                {
-                    file.write_all(&chunk)
-                        .await
-                        .map_err(|e| internal(format!("write error: {e}")))?;
+                let format = upload::text(field).await?.to_lowercase();
+                // Checked as soon as it arrives — the UI sends it ahead of the file — so a bad
+                // value is turned away before gigabytes are uploaded for nothing.
+                if !TARGET_FORMATS.contains(&format.as_str()) {
+                    return Err(bad(format!("unsupported target format: {format}")));
                 }
-                file.flush()
-                    .await
-                    .map_err(|e| internal(format!("flush error: {e}")))?;
-                source_path = Some(src);
+                target = Some(format);
             }
+            Some("combine_audio") => combine_audio = upload::truthy(&upload::text(field).await?),
+            Some("file") => upload = Some(upload::save_file(field, dir.path()).await?),
             _ => {}
         }
     }
 
-    let target_format = target_format.ok_or_else(|| bad("missing 'format' field".into()))?;
-    if !TARGET_FORMATS.contains(&target_format.as_str()) {
-        let _ = fs::remove_dir_all(&dir);
-        return Err(bad(format!("unsupported target format: {target_format}")));
-    }
-    let source_path = source_path.ok_or_else(|| bad("missing 'file' upload".into()))?;
-    let original_name = original_name.unwrap_or_else(|| "upload".to_string());
+    let target = target.ok_or_else(|| bad("missing 'format' field"))?;
+    let upload = upload.ok_or_else(|| bad("missing 'file' upload"))?;
 
-    let stem = Path::new(&original_name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "output".to_string());
-    let output_name = format!("{stem}.{target_format}");
-    let output_path = dir.join(&output_name);
-
-    let source_ext = Path::new(&original_name)
-        .extension()
-        .map(|e| e.to_string_lossy().to_string())
-        .unwrap_or_else(|| "?".to_string());
-
-    let job = Job {
-        id: id.clone(),
-        kind: JobKind::Transcode,
-        status: JobStatus::Queued,
-        progress: 0.0,
-        title: original_name,
-        detail: format!("{source_ext} → {target_format}"),
-        output_name: None,
-        output_size: None,
-        error: None,
-        created_at: Utc::now().timestamp(),
-        output_path: None,
-        dir,
+    let output_name = format!("{}.{target}", upload::stem(&upload.original_name));
+    let source_ext = if upload.ext.is_empty() {
+        "?"
+    } else {
+        upload.ext.as_str()
     };
-    state.insert_job(job.clone());
+    let detail = format!("{source_ext} → {target}");
 
-    tokio::spawn(run_transcode(
-        state,
-        id,
-        source_path,
-        output_path,
-        output_name,
-        target_format,
-        combine_audio,
-    ));
+    let (id, dir) = dir.keep();
+    // The on-disk name is fixed; the client's filename only reaches the download's
+    // Content-Disposition. A 250-byte upload name plus an extension would otherwise exceed the
+    // filesystem's name limit and fail the encode at the very end.
+    let output = dir.join(format!("output.{target}"));
+    let job = Job::new(
+        id.clone(),
+        JobKind::Transcode,
+        upload.original_name,
+        detail,
+        dir,
+    );
+    state.insert_job(job.clone());
+    state.spawn_job(
+        &id,
+        run_transcode(
+            state.clone(),
+            id.clone(),
+            upload.path,
+            output,
+            output_name,
+            target,
+            combine_audio,
+        ),
+    );
 
     Ok(Json(job))
 }
@@ -147,209 +92,184 @@ async fn run_transcode(
     source: PathBuf,
     output: PathBuf,
     output_name: String,
-    target_format: String,
+    target: String,
     combine_audio: bool,
 ) {
-    state.update_job(&id, |j| j.status = JobStatus::Running);
+    let _slot = state.acquire_slot(JobKind::Transcode).await;
+    state.set_running(&id);
 
-    let duration = probe_duration(&source).await;
-    let audio_streams = probe_audio_streams(&source).await;
-    let is_audio = is_audio_target(&target_format);
+    let info = probe(&source).await;
+    let audio_streams = info.as_ref().map_or(0, |i| i.audio.len());
+    let is_audio = is_audio_target(&target);
+    let mix = combine_audio && audio_streams >= 2;
+
+    if audio_streams >= 2 && !mix && is_audio && !supports_multiple_audio(&target) {
+        // Keeping tracks separate is impossible in a single-stream container;
+        // fail with guidance instead of silently dropping tracks.
+        return state.fail(
+            &id,
+            format!(
+                "the source has {audio_streams} audio tracks but {} files can only hold one — \
+                 choose \"Combine into one track\", or convert to MKV, MP4, M4A or OGG to keep them separate",
+                target.to_uppercase()
+            ),
+        );
+    }
+
+    let plan = plan_streams(&target, info.as_ref(), mix);
+    // When the probe failed, fall back to ffmpeg's own selection rather than dropping the video.
+    let video_map = match &info {
+        Some(i) => i.video.as_ref().map(|v| format!("0:{}", v.index)),
+        None => Some("0:v:0?".to_string()),
+    };
 
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y").arg("-i").arg(&source);
-    if audio_streams >= 2 && combine_audio {
+    if mix {
         // Mix every source audio stream into a single track.
         let labels: String = (0..audio_streams).map(|i| format!("[0:a:{i}]")).collect();
         cmd.args([
             "-filter_complex",
             &format!("{labels}amix=inputs={audio_streams}:duration=longest:normalize=0[aout]"),
         ]);
-        if is_audio {
-            cmd.args(["-map", "[aout]"]);
-        } else {
-            cmd.args(["-map", "0:v:0?", "-map", "[aout]"]);
+        if let (false, Some(v)) = (is_audio, &video_map) {
+            cmd.args(["-map", v]);
         }
-    } else if audio_streams >= 2 && is_audio && !supports_multiple_audio(&target_format) {
-        // Keeping tracks separate is impossible in a single-stream container;
-        // fail with guidance instead of silently dropping tracks.
-        state.update_job(&id, |j| {
-            j.status = JobStatus::Failed;
-            j.error = Some(format!(
-                "the source has {audio_streams} audio tracks but {} files can only hold one — \
-                 choose \"Combine into one track\", or convert to MKV, MP4, M4A or OGG to keep them separate",
-                target_format.to_uppercase()
-            ));
-        });
-        return;
+        cmd.args(["-map", "[aout]"]);
     } else if !is_audio {
         // Video containers can carry multiple audio tracks: keep them all
         // instead of ffmpeg's default single-stream pick.
-        cmd.args(["-map", "0:v:0?", "-map", "0:a?"]);
+        if let Some(v) = &video_map {
+            cmd.args(["-map", v]);
+        }
+        cmd.args(["-map", "0:a?"]);
     } else if audio_streams >= 2 {
         // Multi-track-capable audio container: keep every track.
         cmd.args(["-map", "0:a"]);
     }
-    for a in ffmpeg_codec_args(&target_format) {
-        cmd.arg(a);
-    }
-    cmd.arg("-progress")
-        .arg("pipe:1")
-        .arg("-nostats")
-        .arg(&output);
 
-    let state_for_lines = state.clone();
-    let id_for_lines = id.clone();
-    let result = run_with_progress(&mut cmd, |line| {
-        if let Some(value) = line.strip_prefix("out_time=") {
-            if let (Some(total), Some(cur)) = (duration, parse_ffmpeg_time(value)) {
-                if total > 0.0 {
-                    let pct = ((cur / total) * 100.0).clamp(0.0, 99.0) as f32;
-                    state_for_lines.update_job(&id_for_lines, |j| {
-                        if pct > j.progress {
-                            j.progress = pct;
-                        }
-                    });
-                }
+    if !is_audio {
+        if plan.copy_video {
+            cmd.args(["-c:v", "copy"]);
+            let hevc = info
+                .as_ref()
+                .and_then(|i| i.video.as_ref())
+                .is_some_and(|v| v.codec == "hevc");
+            if hevc && matches!(target.as_str(), "mp4" | "mov") {
+                // Apple's players only accept HEVC in MP4 under the hvc1 tag.
+                cmd.args(["-tag:v", "hvc1"]);
             }
+        } else {
+            cmd.args(video_encode_args(&target));
+        }
+    }
+    if plan.copy_audio {
+        cmd.args(["-c:a", "copy"]);
+    } else {
+        cmd.args(audio_encode_args(&target));
+    }
+    cmd.args(container_args(&target));
+    cmd.args(["-progress", "pipe:1", "-nostats"]).arg(&output);
+
+    let has_video = info.as_ref().is_none_or(|i| i.video.is_some());
+    let copied_everything = plan.copy_audio && (is_audio || !has_video || plan.copy_video);
+    if copied_everything {
+        state.append_detail(&id, "no re-encode");
+    } else if plan.copy_video {
+        state.append_detail(&id, "video copied");
+    }
+
+    let duration = info.as_ref().and_then(|i| i.duration);
+    let st = state.clone();
+    let jid = id.clone();
+    let result = run_with_progress(&mut cmd, move |line| {
+        if let (Some(total), Some(cur)) = (duration, out_time(line)) {
+            st.set_progress(&jid, ((cur / total) * 100.0).min(99.0) as f32);
         }
     })
     .await;
 
     match result {
         Ok(r) if r.success && output.is_file() => {
-            let size = fs::metadata(&output).ok().map(|m| m.len());
             // Source no longer needed once the output exists.
-            let _ = fs::remove_file(&source);
-            state.update_job(&id, |j| {
-                j.status = JobStatus::Completed;
-                j.progress = 100.0;
-                j.output_path = Some(output.clone());
-                j.output_name = Some(output_name.clone());
-                j.output_size = size;
-            });
+            let _ = tokio::fs::remove_file(&source).await;
+            state.complete(&id, output, output_name);
         }
-        Ok(r) => state.update_job(&id, |j| {
-            j.status = JobStatus::Failed;
-            j.error = Some(if r.error_tail.is_empty() {
-                "ffmpeg exited with an error".into()
-            } else {
-                r.error_tail
-            });
-        }),
-        Err(e) => state.update_job(&id, |j| {
-            j.status = JobStatus::Failed;
-            j.error = Some(format!("failed to run ffmpeg: {e}"));
-        }),
+        Ok(r) => state.fail(&id, r.error_or("ffmpeg exited with an error")),
+        Err(e) => state.fail(&id, format!("failed to run ffmpeg: {e}")),
     }
 }
 
-/// Count the audio streams in a file via ffprobe.
-pub async fn probe_audio_streams(path: &Path) -> usize {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a",
-            "-show_entries",
-            "stream=index",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .await;
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count(),
-        _ => 0,
-    }
+/// Which streams can go into the target untouched.
+#[derive(Debug, PartialEq)]
+struct StreamPlan {
+    copy_video: bool,
+    copy_audio: bool,
 }
 
-/// Height and frame rate of the first video stream, for sizing an encode.
+/// Copy a stream whenever the target container takes its codec as it is.
 ///
-/// `r_frame_rate` comes back as a rational like `60/1` (and `0/0` for streams that have no
-/// meaningful rate, such as an attached cover image), so it has to be divided rather than parsed
-/// as a float. Anything unreadable returns None, and the caller leaves the source alone rather
-/// than guessing at it.
-pub async fn probe_video_shape(path: &Path) -> (Option<u32>, Option<f64>) {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=height,r_frame_rate",
-            "-of",
-            "default=nw=1:nk=1",
-        ])
-        .arg(path)
-        .output()
-        .await;
-    let Ok(o) = output else { return (None, None) };
-    if !o.status.success() {
-        return (None, None);
-    }
-    let text = String::from_utf8_lossy(&o.stdout);
-    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-    let height = lines
-        .next()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|h| *h > 0);
-    let fps = lines.next().and_then(parse_rational).filter(|f| *f > 0.0);
-    (height, fps)
-}
-
-/// "60/1" -> 60.0, "30000/1001" -> 29.97, "0/0" -> None.
-pub fn parse_rational(s: &str) -> Option<f64> {
-    let (num, den) = s.trim().split_once('/')?;
-    let num: f64 = num.parse().ok()?;
-    let den: f64 = den.parse().ok()?;
-    if den == 0.0 {
-        None
-    } else {
-        Some(num / den)
+/// Re-encoding something that is already H.264 just to change the box around it is all cost and
+/// no benefit: a 20 s 1080p H.264/AAC MKV took 15.4 s to re-encode to MP4 and 0.18 s to copy,
+/// four cores, and the copy is bit-for-bit the original picture. MKV to MP4 is exactly what
+/// recording software produces and people then need, so this is the common case, not a corner.
+fn plan_streams(target: &str, info: Option<&MediaInfo>, mixing_audio: bool) -> StreamPlan {
+    let Some(info) = info else {
+        return StreamPlan {
+            copy_video: false,
+            copy_audio: false,
+        };
+    };
+    StreamPlan {
+        copy_video: info
+            .video
+            .as_ref()
+            .is_some_and(|v| video_copyable(target, v)),
+        // A mix is a new signal by definition.
+        copy_audio: !mixing_audio && info.audio.iter().all(|a| audio_copyable(target, &a.codec)),
     }
 }
 
-pub async fn probe_duration(path: &Path) -> Option<f64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=nw=1:nk=1",
-        ])
-        .arg(path)
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
+fn video_copyable(target: &str, v: &VideoStream) -> bool {
+    let codec = v.codec.as_str();
+    let pix_fmt = v.pix_fmt.as_deref().unwrap_or("");
+    // The re-encode path forces 8-bit 4:2:0 for MP4/MOV because that is what plays everywhere;
+    // a copy has to meet the same bar or "convert to MP4" would hand back a file browsers refuse.
+    let plays_everywhere = matches!(pix_fmt, "yuv420p" | "yuvj420p");
+    match target {
+        "mp4" => match codec {
+            "h264" => plays_everywhere,
+            "hevc" | "av1" => plays_everywhere || pix_fmt == "yuv420p10le",
+            _ => false,
+        },
+        "mov" => match codec {
+            "h264" => plays_everywhere,
+            "hevc" => plays_everywhere || pix_fmt == "yuv420p10le",
+            _ => false,
+        },
+        "mkv" => matches!(codec, "h264" | "hevc" | "av1" | "vp9" | "vp8"),
+        "webm" => matches!(codec, "vp9" | "vp8" | "av1"),
+        // AVI is offered for old hardware players, which want the XviD tag the encode sets.
+        _ => false,
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<f64>()
-        .ok()
 }
 
-/// Parse ffmpeg's `out_time` value ("HH:MM:SS.microseconds") into seconds.
-pub fn parse_ffmpeg_time(s: &str) -> Option<f64> {
-    let s = s.trim();
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 3 {
-        return None;
+fn audio_copyable(target: &str, codec: &str) -> bool {
+    match target {
+        "mp4" | "mov" => matches!(codec, "aac" | "mp3" | "alac"),
+        "mkv" => matches!(
+            codec,
+            "aac" | "mp3" | "opus" | "vorbis" | "flac" | "ac3" | "eac3" | "alac"
+        ),
+        "webm" => matches!(codec, "opus" | "vorbis"),
+        "avi" | "mp3" => codec == "mp3",
+        "m4a" => matches!(codec, "aac" | "alac"),
+        "ogg" => codec == "vorbis",
+        "opus" => codec == "opus",
+        "wav" => codec == "pcm_s16le",
+        "flac" => codec == "flac",
+        _ => false,
     }
-    let h: f64 = parts[0].parse().ok()?;
-    let m: f64 = parts[1].parse().ok()?;
-    let sec: f64 = parts[2].parse().ok()?;
-    Some(h * 3600.0 + m * 60.0 + sec)
 }
 
 /// Whether the target container is audio-only (single audio stream).
@@ -362,33 +282,17 @@ fn supports_multiple_audio(target: &str) -> bool {
     matches!(target, "m4a" | "ogg")
 }
 
-/// ffmpeg encoding arguments for a given target container/codec.
-fn ffmpeg_codec_args(target: &str) -> Vec<&'static str> {
+/// ffmpeg arguments to encode the video stream for a target container.
+fn video_encode_args(target: &str) -> &'static [&'static str] {
     match target {
-        "mp4" => vec![
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
+        "mp4" | "mov" => &[
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-pix_fmt", "yuv420p",
         ],
-        "mkv" => vec![
-            "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "192k",
-        ],
-        "mov" => vec![
-            "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a",
-            "aac", "-b:a", "192k",
-        ],
-        "webm" => vec![
+        "mkv" => &["-c:v", "libx264", "-preset", "medium", "-crf", "23"],
+        // libvpx-vp9 defaults to -cpu-used 1, among its slowest settings. At 4 a 6 s 1080p clip
+        // took 16.5 s instead of 49.6 s on four cores, for a file 6 % larger and an SSIM of
+        // 0.9965 against 0.9964.
+        "webm" => &[
             "-c:v",
             "libvpx-vp9",
             "-b:v",
@@ -397,35 +301,145 @@ fn ffmpeg_codec_args(target: &str) -> Vec<&'static str> {
             "32",
             "-row-mt",
             "1",
-            "-c:a",
-            "libopus",
-        ],
-        "avi" => vec![
-            "-c:v",
-            "mpeg4",
-            "-vtag",
-            "XVID",
-            "-qscale:v",
-            "4",
-            "-c:a",
-            "libmp3lame",
-            "-q:a",
+            "-deadline",
+            "good",
+            "-cpu-used",
             "4",
         ],
-        "mp3" => vec!["-vn", "-c:a", "libmp3lame", "-q:a", "2"],
-        "m4a" => vec!["-vn", "-c:a", "aac", "-b:a", "192k"],
-        "ogg" => vec!["-vn", "-c:a", "libvorbis", "-q:a", "5"],
-        "opus" => vec!["-vn", "-c:a", "libopus", "-b:a", "160k"],
-        "wav" => vec!["-vn", "-c:a", "pcm_s16le"],
-        "flac" => vec!["-vn", "-c:a", "flac"],
-        _ => vec![],
+        "avi" => &["-c:v", "mpeg4", "-vtag", "XVID", "-qscale:v", "4"],
+        _ => &[],
     }
 }
 
-fn bad(msg: String) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, msg)
+/// ffmpeg arguments to encode the audio stream(s) for a target container.
+fn audio_encode_args(target: &str) -> &'static [&'static str] {
+    match target {
+        "mp4" | "mov" | "mkv" | "m4a" => &["-c:a", "aac", "-b:a", "192k"],
+        "webm" => &["-c:a", "libopus"],
+        "avi" => &["-c:a", "libmp3lame", "-q:a", "4"],
+        "mp3" => &["-c:a", "libmp3lame", "-q:a", "2"],
+        "ogg" => &["-c:a", "libvorbis", "-q:a", "5"],
+        "opus" => &["-c:a", "libopus", "-b:a", "160k"],
+        "wav" => &["-c:a", "pcm_s16le"],
+        "flac" => &["-c:a", "flac"],
+        _ => &[],
+    }
 }
 
-fn internal(msg: String) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, msg)
+/// Arguments about the file rather than any one stream.
+fn container_args(target: &str) -> &'static [&'static str] {
+    match target {
+        // Index at the front, so a browser can start playing before the whole file arrives.
+        "mp4" => &["-movflags", "+faststart"],
+        "mp3" | "m4a" | "ogg" | "opus" | "wav" | "flac" => &["-vn"],
+        _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::AudioStream;
+
+    fn source(video: Option<(&str, &str)>, audio: &[&str]) -> MediaInfo {
+        MediaInfo {
+            duration: Some(10.0),
+            video: video.map(|(codec, pix_fmt)| VideoStream {
+                index: 0,
+                codec: codec.into(),
+                height: Some(1080),
+                fps: Some(30.0),
+                pix_fmt: Some(pix_fmt.into()),
+            }),
+            audio: audio
+                .iter()
+                .map(|c| AudioStream { codec: (*c).into() })
+                .collect(),
+        }
+    }
+
+    fn plan(target: &str, info: &MediaInfo) -> (bool, bool) {
+        let p = plan_streams(target, Some(info), false);
+        (p.copy_video, p.copy_audio)
+    }
+
+    #[test]
+    fn a_recording_in_mkv_is_remuxed_into_mp4() {
+        let obs = source(Some(("h264", "yuv420p")), &["aac", "aac"]);
+        assert_eq!(plan("mp4", &obs), (true, true));
+        assert_eq!(plan("mov", &obs), (true, true));
+    }
+
+    #[test]
+    fn only_the_stream_that_does_not_fit_is_re_encoded() {
+        let webm_audio = source(Some(("h264", "yuv420p")), &["opus"]);
+        assert_eq!(plan("mp4", &webm_audio), (true, false));
+        let vp9 = source(Some(("vp9", "yuv420p")), &["opus"]);
+        assert_eq!(plan("mp4", &vp9), (false, false));
+        assert_eq!(plan("webm", &vp9), (true, true));
+        assert_eq!(plan("mkv", &vp9), (true, true));
+    }
+
+    #[test]
+    fn mp4_keeps_its_plays_everywhere_promise() {
+        // 4:4:4 and 10-bit H.264 are valid MP4 but most browsers and phones refuse them.
+        let lossless = source(Some(("h264", "yuv444p")), &["aac"]);
+        assert_eq!(plan("mp4", &lossless), (false, true));
+        assert_eq!(plan("mkv", &lossless), (true, true));
+        let ten_bit = source(Some(("h264", "yuv420p10le")), &["aac"]);
+        assert_eq!(plan("mp4", &ten_bit), (false, true));
+        let hevc_ten_bit = source(Some(("hevc", "yuv420p10le")), &["aac"]);
+        assert_eq!(plan("mp4", &hevc_ten_bit), (true, true));
+    }
+
+    #[test]
+    fn avi_is_always_encoded_for_old_players() {
+        let mpeg4 = source(Some(("mpeg4", "yuv420p")), &["mp3"]);
+        assert_eq!(plan("avi", &mpeg4), (false, true));
+    }
+
+    #[test]
+    fn audio_targets_copy_only_their_own_codec() {
+        let song = source(None, &["aac"]);
+        assert!(plan("m4a", &song).1);
+        assert!(!plan("mp3", &song).1);
+        assert!(plan("mp3", &source(None, &["mp3"])).1);
+        assert!(!plan("ogg", &source(None, &["opus"])).1);
+        assert!(plan("wav", &source(None, &["pcm_s16le"])).1);
+        assert!(!plan("wav", &source(None, &["pcm_s24le"])).1);
+    }
+
+    #[test]
+    fn mixing_always_encodes_the_audio() {
+        let obs = source(Some(("h264", "yuv420p")), &["aac", "aac"]);
+        let p = plan_streams("mp4", Some(&obs), true);
+        assert_eq!(
+            p,
+            StreamPlan {
+                copy_video: true,
+                copy_audio: false
+            }
+        );
+    }
+
+    #[test]
+    fn an_unreadable_source_is_encoded() {
+        assert_eq!(
+            plan_streams("mp4", None, false),
+            StreamPlan {
+                copy_video: false,
+                copy_audio: false
+            }
+        );
+    }
+
+    #[test]
+    fn every_target_has_encode_arguments() {
+        for t in TARGET_FORMATS {
+            assert!(!audio_encode_args(t).is_empty(), "{t} has no audio args");
+            if !is_audio_target(t) {
+                assert!(!video_encode_args(t).is_empty(), "{t} has no video args");
+            }
+        }
+    }
 }

@@ -2,14 +2,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use axum::{extract::State, http::StatusCode, Json};
-use chrono::Utc;
+use axum::{extract::State, Json};
 use serde::Deserialize;
 use tokio::process::Command;
-use uuid::Uuid;
 
 use crate::proc::run_with_progress;
-use crate::state::{AppState, Job, JobKind, JobStatus};
+use crate::state::{AppState, Job, JobKind};
+use crate::upload::{bad, ApiError, JobDir};
 
 #[derive(Deserialize)]
 pub struct DownloadRequest {
@@ -53,23 +52,17 @@ fn ytdlp_audio_format(f: &str) -> &str {
 pub async fn start_download(
     State(state): State<AppState>,
     Json(req): Json<DownloadRequest>,
-) -> Result<Json<Job>, (StatusCode, String)> {
+) -> Result<Json<Job>, ApiError> {
     let url = req.url.trim().to_string();
     if url.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "url is required".into()));
+        return Err(bad("url is required"));
     }
     if !is_supported_url(&url) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "url must start with http:// or https://".into(),
-        ));
+        return Err(bad("url must start with http:// or https://"));
     }
     let format = req.format.trim().to_lowercase();
     if !is_audio_format(&format) && !VIDEO_FORMATS.contains(&format.as_str()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("unsupported format: {format}"),
-        ));
+        return Err(bad(format!("unsupported format: {format}")));
     }
     let audio = is_audio_format(&format);
     let quality = if req.quality.trim().is_empty() {
@@ -78,50 +71,32 @@ pub async fn start_download(
         req.quality.trim().to_string()
     };
     if !audio && !QUALITIES.contains(&quality.as_str()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("unsupported quality: {quality}"),
-        ));
-    }
-
-    let id = Uuid::new_v4().to_string();
-    let dir = state.job_dir(&id);
-    if let Err(e) = fs::create_dir_all(&dir) {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("mkdir failed: {e}"),
-        ));
+        return Err(bad(format!("unsupported quality: {quality}")));
     }
 
     let detail = if audio {
         format!("audio · {format}")
+    } else if quality == "best" {
+        format!("best · {format}")
     } else {
-        let q = if quality == "best" {
-            "best".to_string()
-        } else {
-            format!("{quality}p")
-        };
-        format!("{q} · {format}")
+        format!("{quality}p · {format}")
     };
 
-    let job = Job {
-        id: id.clone(),
-        kind: JobKind::Download,
-        status: JobStatus::Queued,
-        progress: 0.0,
-        title: url.clone(),
+    let (id, dir) = JobDir::create(&state)?.keep();
+    let job = Job::new(
+        id.clone(),
+        JobKind::Download,
+        url.clone(),
         detail,
-        output_name: None,
-        output_size: None,
-        error: None,
-        created_at: Utc::now().timestamp(),
-        output_path: None,
-        dir: dir.clone(),
-    };
+        dir.clone(),
+    );
     state.insert_job(job.clone());
 
     // Run the download in the background and report progress into the job map.
-    tokio::spawn(run_download(state, id, url, format, quality, dir));
+    state.spawn_job(
+        &id,
+        run_download(state.clone(), id.clone(), url, format, quality, dir),
+    );
 
     Ok(Json(job))
 }
@@ -134,7 +109,8 @@ async fn run_download(
     quality: String,
     dir: PathBuf,
 ) {
-    state.update_job(&id, |j| j.status = JobStatus::Running);
+    let _slot = state.acquire_slot(JobKind::Download).await;
+    state.set_running(&id);
 
     let out_template = format!("{}/%(title).200B.%(ext)s", dir.display());
     let mut args: Vec<String> = vec![
@@ -142,6 +118,10 @@ async fn run_download(
         "--no-color".into(),
         "--newline".into(),
         "--no-warnings".into(),
+        // DASH and HLS sources arrive as hundreds of small fragments, fetched one at a time by
+        // default; a few in flight hides the per-request latency.
+        "--concurrent-fragments".into(),
+        "4".into(),
         "--progress-template".into(),
         "PG:%(progress._percent_str)s".into(),
         "-o".into(),
@@ -155,15 +135,45 @@ async fn run_download(
         args.push("--audio-quality".into());
         args.push("0".into());
     } else {
-        let selector = if quality == "best" {
-            "bv*+ba/b".to_string()
-        } else {
-            format!("bv*[height<={q}]+ba/b[height<={q}]", q = quality)
-        };
         args.push("-f".into());
-        args.push(selector);
+        args.push("bv*+ba/b".into());
+        // A resolution ceiling is a sort, not a filter: a filter rejects every format whose
+        // height the site does not report — any direct link to a file — and fails with
+        // "Requested format is not available". The sort takes the largest at or under the
+        // ceiling, or the smallest above it if there is nothing under. For MP4 and WebM, prefer
+        // formats that already suit the container within a resolution, so the result plays
+        // where those containers are expected to. Otherwise yt-dlp's own order stands.
+        let mut sort: Vec<String> = Vec::new();
+        if quality != "best" {
+            sort.push(format!("res:{quality}"));
+        }
+        let fits = match format.as_str() {
+            "mp4" => Some("ext:mp4:m4a"),
+            "webm" => Some("ext:webm:webm"),
+            _ => None,
+        };
+        if let Some(ext) = fits {
+            if sort.is_empty() {
+                // Keep resolution ahead of the container, or MP4 would win over a sharper WebM.
+                sort.push("res".into());
+            }
+            sort.push(ext.into());
+        }
+        if !sort.is_empty() {
+            args.push("-S".into());
+            args.push(sort.join(","));
+        }
         args.push("--merge-output-format".into());
         args.push(format.clone());
+        // The merge format only applies when separate video and audio streams are merged; a site
+        // that serves one combined file used to come back in whatever container it had, so
+        // asking for MKV could produce an MP4. Remuxing is a copy, not an encode. WebM is left
+        // alone: it only takes VP8/VP9/AV1, so forcing it would fail outright on an H.264 source
+        // where a working file in another container is the more useful outcome.
+        if format != "webm" {
+            args.push("--remux-video".into());
+            args.push(format.clone());
+        }
     }
     // `--` first: without it a URL that begins with a dash is parsed as a
     // yt-dlp option, and options like `--exec` run arbitrary commands.
@@ -173,17 +183,12 @@ async fn run_download(
     let mut cmd = Command::new("yt-dlp");
     cmd.args(&args);
 
-    let state_for_lines = state.clone();
-    let id_for_lines = id.clone();
-    let result = run_with_progress(&mut cmd, |line| {
-        if let Some(rest) = line.strip_prefix("PG:") {
-            if let Some(pct) = parse_percent(rest) {
-                state_for_lines.update_job(&id_for_lines, |j| {
-                    if pct > j.progress {
-                        j.progress = pct;
-                    }
-                });
-            }
+    let st = state.clone();
+    let jid = id.clone();
+    let result = run_with_progress(&mut cmd, move |line| {
+        if let Some(pct) = line.strip_prefix("PG:").and_then(parse_percent) {
+            // Merging the streams afterwards takes a moment; 100 % waits for that.
+            st.set_progress(&jid, pct.min(99.0));
         }
     })
     .await;
@@ -195,39 +200,13 @@ async fn run_download(
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "download".to_string());
-                let size = fs::metadata(&path).ok().map(|m| m.len());
-                state.update_job(&id, |j| {
-                    j.status = JobStatus::Completed;
-                    j.progress = 100.0;
-                    j.output_path = Some(path.clone());
-                    j.output_name = Some(name);
-                    j.output_size = size;
-                });
+                state.complete(&id, path, name);
             }
-            None => fail(
-                &state,
-                &id,
-                "download finished but no output file was produced".into(),
-            ),
+            None => state.fail(&id, "download finished but no output file was produced"),
         },
-        Ok(r) => fail(
-            &state,
-            &id,
-            if r.error_tail.is_empty() {
-                "yt-dlp exited with an error".into()
-            } else {
-                r.error_tail
-            },
-        ),
-        Err(e) => fail(&state, &id, format!("failed to run yt-dlp: {e}")),
+        Ok(r) => state.fail(&id, r.error_or("yt-dlp exited with an error")),
+        Err(e) => state.fail(&id, format!("failed to run yt-dlp: {e}")),
     }
-}
-
-fn fail(state: &AppState, id: &str, msg: String) {
-    state.update_job(id, |j| {
-        j.status = JobStatus::Failed;
-        j.error = Some(msg);
-    });
 }
 
 /// Parse a yt-dlp percent string like " 42.3%" into a float.
