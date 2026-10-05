@@ -1,14 +1,36 @@
-import { useState } from "react";
-import { Job, startDownload } from "../api";
+import { FormEvent, useState } from "react";
+import { Job, errorMessage, startDownload } from "../api";
+import { formatLabel } from "../format";
+import { isString, oneOf, usePersistentState } from "../hooks/usePersistentState";
+import ChoiceGroup, { Choice } from "./ChoiceGroup";
+import Icon from "./Icon";
 import JobList from "./JobList";
 
 interface Props {
   jobs: Job[];
-  onChanged: () => void;
+  onJob: (job: Job) => void;
+  onDelete: (ids: string[]) => void;
 }
 
-const VIDEO_FORMATS = ["mp4", "mkv", "webm"];
-const AUDIO_FORMATS = ["mp3", "m4a", "opus", "ogg", "wav", "flac"];
+type Mode = "video" | "audio";
+const MODES: Choice<Mode>[] = [
+  { value: "video", label: "Video" },
+  { value: "audio", label: "Audio only" },
+];
+
+const VIDEO_FORMATS = ["mp4", "mkv", "webm"] as const;
+const AUDIO_FORMATS = ["mp3", "m4a", "opus", "ogg", "wav", "flac"] as const;
+const FORMAT_HINTS: Record<string, string> = {
+  mp4: "Plays everywhere",
+  mkv: "Keeps every stream, plays in VLC and most desktop players",
+  webm: "Open format, best in browsers",
+  mp3: "Plays everywhere",
+  m4a: "AAC, smaller than MP3 at the same quality",
+  opus: "Smallest files for the quality",
+  ogg: "Vorbis",
+  wav: "Uncompressed",
+  flac: "Lossless",
+};
 
 const QUALITIES = [
   { value: "best", label: "Best available" },
@@ -18,99 +40,160 @@ const QUALITIES = [
   { value: "720", label: "720p" },
   { value: "480", label: "480p" },
   { value: "360", label: "360p" },
-];
+] as const;
 
-export default function DownloadTab({ jobs, onChanged }: Props) {
+const choices = <T extends string>(formats: readonly T[]): Choice<T>[] =>
+  formats.map((f) => ({ value: f, label: formatLabel(f), hint: FORMAT_HINTS[f] }));
+
+const canPaste = typeof navigator !== "undefined" && !!navigator.clipboard?.readText && window.isSecureContext;
+
+export default function DownloadTab({ jobs, onJob, onDelete }: Props) {
   const [url, setUrl] = useState("");
-  const [format, setFormat] = useState("mp4");
-  const [quality, setQuality] = useState("best");
+  const [mode, setMode] = usePersistentState<Mode>("download.mode", "video", oneOf(["video", "audio"]));
+  const [videoFormat, setVideoFormat] = usePersistentState("download.videoFormat", "mp4", oneOf(VIDEO_FORMATS));
+  const [audioFormat, setAudioFormat] = usePersistentState("download.audioFormat", "mp3", oneOf(AUDIO_FORMATS));
+  const [quality, setQuality] = usePersistentState(
+    "download.quality",
+    "best",
+    (v): v is string => isString(v) && QUALITIES.some((q) => q.value === v)
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const isAudio = AUDIO_FORMATS.includes(format);
+  const audio = mode === "audio";
+  const format = audio ? audioFormat : videoFormat;
 
-  async function submit(e: React.FormEvent) {
+  async function submit(e: FormEvent) {
     e.preventDefault();
     setError(null);
-    if (!url.trim()) {
-      setError("Please paste a video URL.");
+    const trimmed = url.trim();
+    if (!trimmed) {
+      setError("Paste a link to a video or a page that has one.");
+      return;
+    }
+    if (!/^https?:\/\//i.test(trimmed)) {
+      setError("The link has to start with http:// or https://.");
       return;
     }
     setBusy(true);
     try {
-      await startDownload({ url: url.trim(), format, quality });
+      onJob(await startDownload({ url: trimmed, format, quality: audio ? "" : quality }));
       setUrl("");
-      onChanged();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errorMessage(err));
     } finally {
       setBusy(false);
     }
   }
 
+  async function paste() {
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      if (text) {
+        setUrl(text);
+        setError(null);
+      }
+    } catch {
+      setError("The browser did not allow reading the clipboard — paste with Ctrl+V instead.");
+    }
+  }
+
   return (
-    <div className="tab-panel">
-      <form className="card form" onSubmit={submit}>
-        <label className="field">
-          <span>Video URL</span>
-          <input
-            type="text"
-            placeholder="https://www.youtube.com/watch?v=..."
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            autoFocus
-          />
-        </label>
+    <>
+      <form className="card form" onSubmit={submit} noValidate>
+        <header className="card-header">
+          <h2>Download from a link</h2>
+          <p>Video or audio from YouTube and the thousands of other sites yt-dlp supports.</p>
+        </header>
 
-        <div className="field-row">
-          <label className="field">
-            <span>Format</span>
-            <select value={format} onChange={(e) => setFormat(e.target.value)}>
-              <optgroup label="Video">
-                {VIDEO_FORMATS.map((f) => (
-                  <option key={f} value={f}>
-                    {f.toUpperCase()}
+        <div className="field">
+          <label className="field-label" htmlFor="download-url">
+            Link
+          </label>
+          <div className="input-group">
+            <Icon name="link" size={18} className="input-icon" />
+            <input
+              id="download-url"
+              type="url"
+              inputMode="url"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="https://www.youtube.com/watch?v=…"
+              value={url}
+              onChange={(e) => {
+                setUrl(e.target.value);
+                if (error) setError(null);
+              }}
+              aria-invalid={!!error}
+              aria-describedby={error ? "download-error" : undefined}
+              autoFocus
+            />
+            {canPaste && !url && (
+              <button type="button" className="input-action" onClick={paste}>
+                <Icon name="clipboard" size={16} />
+                Paste
+              </button>
+            )}
+            {url && (
+              <button type="button" className="input-action" aria-label="Clear link" onClick={() => setUrl("")}>
+                <Icon name="x" size={16} />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="options">
+          <ChoiceGroup legend="Get" value={mode} options={MODES} onChange={setMode} variant="segmented" />
+          {audio ? (
+            <ChoiceGroup legend="Audio format" value={audioFormat} options={choices(AUDIO_FORMATS)} onChange={setAudioFormat} />
+          ) : (
+            <ChoiceGroup legend="Video format" value={videoFormat} options={choices(VIDEO_FORMATS)} onChange={setVideoFormat} />
+          )}
+          {!audio && (
+            <div className="field field-quality">
+              <label className="field-label" htmlFor="download-quality">
+                Quality
+              </label>
+              <select id="download-quality" value={quality} onChange={(e) => setQuality(e.target.value)}>
+                {QUALITIES.map((q) => (
+                  <option key={q.value} value={q.value}>
+                    {q.label}
                   </option>
                 ))}
-              </optgroup>
-              <optgroup label="Audio only">
-                {AUDIO_FORMATS.map((f) => (
-                  <option key={f} value={f}>
-                    {f.toUpperCase()}
-                  </option>
-                ))}
-              </optgroup>
-            </select>
-          </label>
+              </select>
+            </div>
+          )}
+        </div>
 
-          <label className="field">
-            <span>Quality</span>
-            <select
-              value={quality}
-              onChange={(e) => setQuality(e.target.value)}
-              disabled={isAudio}
-            >
-              {QUALITIES.map((q) => (
-                <option key={q.value} value={q.value}>
-                  {q.label}
-                </option>
-              ))}
-            </select>
-          </label>
+        {error && (
+          <p className="form-error" id="download-error" role="alert">
+            <Icon name="alert" size={16} />
+            {error}
+          </p>
+        )}
 
-          <button className="btn btn-primary submit" type="submit" disabled={busy}>
+        <div className="form-actions">
+          <p className="hint">
+            {audio
+              ? "Takes the best audio the site offers and converts it."
+              : quality === "best"
+                ? "Takes the highest resolution the site offers."
+                : "Takes the highest resolution up to your limit, or the closest above it if there is nothing smaller."}
+          </p>
+          <button className="btn btn-primary" type="submit" disabled={busy}>
+            <Icon name="download" size={18} />
             {busy ? "Starting…" : "Download"}
           </button>
         </div>
-
-        {isAudio && (
-          <p className="hint">Audio-only format selected — quality picks the best source audio.</p>
-        )}
-        {error && <p className="form-error">{error}</p>}
       </form>
 
-      <h2 className="section-title">Downloads</h2>
-      <JobList jobs={jobs} onChanged={onChanged} />
-    </div>
+      <JobList
+        title="Downloads"
+        jobs={jobs}
+        onDelete={onDelete}
+        emptyTitle="No downloads yet"
+        emptyHint="Paste a link above — finished files wait here for you to save them."
+      />
+    </>
   );
 }

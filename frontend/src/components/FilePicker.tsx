@@ -1,8 +1,14 @@
 import { useRef, useState } from "react";
+import Icon from "./Icon";
 
 interface Props {
   accept?: string;
   multiple?: boolean;
+  disabled?: boolean;
+  /// What the zone is for, read out by screen readers.
+  label: string;
+  /// Short line under the call to action, e.g. "Video, audio or images".
+  hint?: string;
   fileNames: string[];
   onPick: (files: File[]) => void;
 }
@@ -10,34 +16,48 @@ interface Props {
 /// Styled replacement for the native file input: a clickable drop zone with
 /// keyboard support. The real input stays hidden and is cleared after every
 /// pick so selecting the same file twice still fires onChange.
-export default function FilePicker({ accept, multiple, fileNames, onPick }: Props) {
+export default function FilePicker({ accept, multiple, disabled, label, hint, fileNames, onPick }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
+  // dragenter/dragleave also fire for every child element crossed; count them so the
+  // highlight does not flicker while the pointer moves over the text.
+  const depth = useRef(0);
   const [dragOver, setDragOver] = useState(false);
 
   function handleFiles(list: FileList | null) {
+    if (disabled) return;
     const files = list ? Array.from(list) : [];
-    onPick(multiple ? files : files.slice(0, 1));
+    if (files.length > 0) onPick(multiple ? files : files.slice(0, 1));
   }
+
+  const open = () => !disabled && inputRef.current?.click();
 
   return (
     <div
-      className={`file-picker${dragOver ? " drag-over" : ""}${fileNames.length > 0 ? " has-files" : ""}`}
+      className={`file-picker${dragOver ? " drag-over" : ""}${fileNames.length > 0 ? " has-files" : ""}${disabled ? " disabled" : ""}`}
       role="button"
-      tabIndex={0}
-      onClick={() => inputRef.current?.click()}
+      tabIndex={disabled ? -1 : 0}
+      aria-label={label}
+      aria-disabled={disabled}
+      onClick={open}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          inputRef.current?.click();
+          open();
         }
       }}
-      onDragOver={(e) => {
+      onDragEnter={(e) => {
         e.preventDefault();
-        setDragOver(true);
+        depth.current += 1;
+        if (!disabled) setDragOver(true);
       }}
-      onDragLeave={() => setDragOver(false)}
+      onDragOver={(e) => e.preventDefault()}
+      onDragLeave={() => {
+        depth.current = Math.max(0, depth.current - 1);
+        if (depth.current === 0) setDragOver(false);
+      }}
       onDrop={(e) => {
         e.preventDefault();
+        depth.current = 0;
         setDragOver(false);
         handleFiles(e.dataTransfer.files);
       }}
@@ -53,23 +73,19 @@ export default function FilePicker({ accept, multiple, fileNames, onPick }: Prop
           e.target.value = "";
         }}
       />
-      <span className="file-picker-icon" aria-hidden="true">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-          <polyline points="17 8 12 3 7 8" />
-          <line x1="12" y1="3" x2="12" y2="15" />
-        </svg>
+      <span className="file-picker-icon">
+        <Icon name="upload" size={20} />
       </span>
       <span className="file-picker-text">
         {fileNames.length === 0 ? (
           <>
-            <strong>Choose {multiple ? "files" : "a file"}</strong>
-            <span>or drag and drop here</span>
+            <strong>{dragOver ? "Drop to add" : `Choose ${multiple ? "files" : "a file"} or drag ${multiple ? "them" : "it"} here`}</strong>
+            {hint && <span>{hint}</span>}
           </>
         ) : (
           <>
             <strong>{fileNames.length === 1 ? fileNames[0] : `${fileNames.length} files selected`}</strong>
-            <span>Click to change</span>
+            <span>Click or drop to replace</span>
           </>
         )}
       </span>
